@@ -550,13 +550,23 @@ local function addLighting(v)
     v.lights[#v.lights + 1] = tween
 
     if dark then
+        -- These HUD rails are decorative background elements. Mark them so
+        -- the cinematic slice renderer does not clone them once per slice;
+        -- doing so would multiply the rails into the visible line pattern
+        -- during the reveal. They remain part of the normal Midnight view.
         for i = 1, 4 do
-            rule(v.root, UDim2.new(i / 5, 0, 0, 0),
-                UDim2.new(0, 1, 1, 0), v.C.accent, 0.96).ZIndex = 1
+            local rail = rule(v.root, UDim2.new(i / 5, 0, 0, 0),
+                UDim2.new(0, 1, 1, 0), v.C.accent, 0.96)
+            rail.ZIndex = 1
+            rail.Name = "HUDRailV" .. i
+            rail:SetAttribute("TransitionSkip", true)
         end
         for i = 1, 5 do
-            rule(v.root, UDim2.new(0, 0, i / 6, 0),
-                UDim2.new(1, 0, 0, 1), v.C.accent, 0.975).ZIndex = 1
+            local rail = rule(v.root, UDim2.new(0, 0, i / 6, 0),
+                UDim2.new(1, 0, 0, 1), v.C.accent, 0.975)
+            rail.ZIndex = 1
+            rail.Name = "HUDRailH" .. i
+            rail:SetAttribute("TransitionSkip", true)
         end
     else
         rule(v.root, UDim2.new(1, -30, 0, 103),
@@ -1395,6 +1405,11 @@ local function shallowClone(source)
 end
 
 local function cloneSliceBranch(source, parent, top, bottom, clipTop, clipBottom)
+    -- Decorative elements explicitly marked as transition-excluded should
+    -- stay out of per-slice clones. This prevents full-panel rails/grids from
+    -- being duplicated once for every reveal slice.
+    if source:GetAttribute("TransitionSkip") then return nil end
+
     if source:IsA("GuiObject") then
         if not source.Visible then return nil end
         local y = source.AbsolutePosition.Y
