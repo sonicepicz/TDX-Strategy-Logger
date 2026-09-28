@@ -1,0 +1,2065 @@
+-- TDX / MIDNIGHT + IVORY
+-- One application, one gameplay worker, two independently constructed views.
+-- Uses the exact TDX client contracts supplied in the original scripts.
+-- Reviewed statically; not runtime-tested inside Roblox/TDX.
+--
+-- The reveal uses temporary, pruned horizontal GUI slices. Each slice clips
+-- an incoming-view copy at a calculated diagonal boundary. These copies have
+-- no callbacks, workers, or event connections. Shared display updates are
+-- mirrored into them while the transition runs.
+--
+-- Manual theme requests can reverse an in-progress reveal without resetting
+-- gameplay, rebuilding the views, or starting another worker.
+
+local THEME_SETTINGS = {
+    Enabled = true,
+    InitialTheme = "MIDNIGHT",
+    Automatic = true,
+    MidnightDuration = 30,
+    IvoryDuration = 30,
+    TransitionDuration = 2.2,
+}
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+assert(player, "Run on the client after TDX loads.")
+local playerGui = player:WaitForChild("PlayerGui")
+
+local GUI_NAME = "TDXMidnightIvoryTransform"
+local ACK_TIMEOUT, AUTO_WINDOW = 8, 12
+local OLD_NAMES = {
+    "TDXUpgradePanelV2", "TDXUpgradePanelV3", "TDXUpgradePanelV4",
+    "TDXUpgradePanelV5", "TDXUpgradePanelV6", "TDXUpgradePanelV7",
+    "TDXUpgradePanelV8", "TDXUpgradePanelV9", "TDXUpgradePanelV10",
+    "TDXMidnightCommand", "TDXIvoryStudio", GUI_NAME,
+}
+
+local function existingProblem()
+    for _, name in ipairs(OLD_NAMES) do
+        for _, old in ipairs(playerGui:GetChildren()) do
+            if old.Name == name then
+                local pending = old:GetAttribute("OutstandingUpgrade")
+                if pending == true then
+                    return "Existing panel has an unresolved upgrade."
+                elseif pending == nil then
+                    return "Close the older panel after its upgrades settle."
+                end
+            end
+        end
+    end
+end
+
+local problem = existingProblem()
+if problem then
+    warn("[TDX] " .. problem)
+    return
+end
+
+local function child(parent, name)
+    local item = parent:WaitForChild(name, 12)
+    assert(item, "Missing dependency: " .. name)
+    return item
+end
+
+local API
+local loaded, loadError = pcall(function()
+    local client = child(child(player, "PlayerScripts"), "Client")
+    local common = child(child(RS, "TDX_Shared"), "Common")
+    local gameModule = child(client, "GameClass")
+    local bindables = require(child(common, "BindableHandler"))
+
+    API = {
+        UI = require(child(child(client, "UserInterfaceHandler"), "TowerUIHandler")),
+        Input = require(child(client, "UserInputHandler")),
+        Game = require(gameModule),
+        Towers = require(child(gameModule, "TowerClass")),
+        Players = require(child(client, "PlayerClass")),
+        Upgrade = bindables.GetEvent("HotkeyUpgradeTower"),
+        Target = bindables.GetEvent("HotkeyChangeQueryModeLeft"),
+    }
+
+    assert(
+        type(API.UI.GetCurrentTower) == "function"
+        and type(API.Input.GetState) == "function"
+        and type(API.Game.GetTowerCostMultiplier) == "function"
+        and type(API.Towers.GetTower) == "function"
+        and type(API.Towers.GetTowers) == "function"
+        and type(API.Players.GetLocalPlayerWrapper) == "function"
+        and API.Upgrade and type(API.Upgrade.Fire) == "function"
+        and API.Target and type(API.Target.Fire) == "function",
+        "TDX client contract changed."
+    )
+end)
+
+if not loaded then
+    warn("[TDX] " .. tostring(loadError))
+    return
+end
+
+problem = existingProblem()
+if problem then
+    warn("[TDX] " .. problem)
+    return
+end
+
+for _, old in ipairs(playerGui:GetChildren()) do
+    if table.find(OLD_NAMES, old.Name) then
+        old:Destroy()
+    end
+end
+
+local PATHS = {
+    {name = "TOP MAX", detail = "Maximum top", a = 5, b = 2},
+    {name = "TOP VALUE", detail = "Efficient top", a = 4, b = 2},
+    {name = "BOTTOM VALUE", detail = "Efficient bottom", a = 2, b = 4},
+    {name = "BOTTOM MAX", detail = "Maximum bottom", a = 2, b = 5},
+}
+
+local S = {
+    alive = true,
+    busy = false,
+    faulted = false,
+    path = 1,
+    job = nil,
+    uncertain = nil,
+    outstanding = false,
+    auto = false,
+    targetAuto = false,
+    collapsed = false,
+    closing = false,
+    connections = {},
+    seen = {},
+    fresh = {},
+    targeted = setmetatable({}, {__mode = "k"}),
+    status = "Select a tower, choose a preset, and begin.",
+    bad = false,
+    display = {
+        name = "Choose a tower",
+        selected = false,
+        owned = false,
+        a = 0,
+        b = 0,
+        cash = 0,
+    },
+}
+
+local function positive(value, fallback, minimum)
+    if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+        return fallback
+    end
+    return math.max(minimum, value)
+end
+
+THEME_SETTINGS.MidnightDuration =
+    positive(THEME_SETTINGS.MidnightDuration, 30, 0.1)
+THEME_SETTINGS.IvoryDuration =
+    positive(THEME_SETTINGS.IvoryDuration, 30, 0.1)
+THEME_SETTINGS.TransitionDuration =
+    positive(THEME_SETTINGS.TransitionDuration, 2.2, 0.25)
+
+local T = {
+    current = THEME_SETTINGS.InitialTheme == "IVORY" and "IVORY" or "MIDNIGHT",
+    automatic = THEME_SETTINGS.Enabled and THEME_SETTINGS.Automatic == true,
+    deadline = 0,
+    transition = nil,
+    mirrors = {},
+    width = 460,
+    height = 740,
+    scale = 1,
+}
+
+local palettes = {
+    MIDNIGHT = {
+        bg = Color3.fromRGB(7, 12, 24),
+        surface = Color3.fromRGB(13, 23, 41),
+        surface2 = Color3.fromRGB(19, 33, 55),
+        selected = Color3.fromRGB(24, 48, 81),
+        border = Color3.fromRGB(43, 63, 90),
+        text = Color3.fromRGB(229, 239, 255),
+        muted = Color3.fromRGB(143, 163, 190),
+        accent = Color3.fromRGB(112, 176, 255),
+        secondary = Color3.fromRGB(141, 150, 230),
+        green = Color3.fromRGB(113, 215, 203),
+        danger = Color3.fromRGB(242, 151, 168),
+        empty = Color3.fromRGB(43, 63, 90),
+        note = Color3.fromRGB(13, 23, 41),
+        warning = Color3.fromRGB(53, 43, 35),
+        dangerSoft = Color3.fromRGB(56, 26, 42),
+    },
+    IVORY = {
+        bg = Color3.fromRGB(244, 240, 230),
+        surface = Color3.fromRGB(255, 252, 245),
+        surface2 = Color3.fromRGB(237, 232, 219),
+        selected = Color3.fromRGB(226, 234, 217),
+        border = Color3.fromRGB(211, 207, 190),
+        text = Color3.fromRGB(42, 56, 47),
+        muted = Color3.fromRGB(112, 117, 101),
+        accent = Color3.fromRGB(57, 91, 69),
+        secondary = Color3.fromRGB(163, 131, 73),
+        green = Color3.fromRGB(59, 103, 74),
+        danger = Color3.fromRGB(153, 66, 58),
+        empty = Color3.fromRGB(222, 224, 210),
+        note = Color3.fromRGB(240, 243, 232),
+        warning = Color3.fromRGB(246, 236, 213),
+        dangerSoft = Color3.fromRGB(247, 231, 222),
+    },
+}
+
+local views = {}
+local visualTweens = {}
+local feedbackRecords = {}
+local dragInput, dragStart, panelStart
+local fit, cleanup, requestClose, requestTheme, dispatch
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    S.connections[#S.connections + 1] = connection
+    return connection
+end
+
+local function make(className, parent, properties)
+    local object = Instance.new(className)
+    for key, value in pairs(properties or {}) do
+        object[key] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function corner(object, radius)
+    return make("UICorner", object, {
+        CornerRadius = UDim.new(0, radius or 12),
+    })
+end
+
+local function stroke(object, color, transparency, thickness)
+    return make("UIStroke", object, {
+        Color = color,
+        Transparency = transparency or 0,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+end
+
+local function gradient(object, first, last, rotation)
+    return make("UIGradient", object, {
+        Color = ColorSequence.new(first, last),
+        Rotation = rotation or 0,
+    })
+end
+
+local function set(object, property, value)
+    if object[property] ~= value then
+        object[property] = value
+    end
+    local copies = T.mirrors[object]
+    if copies then
+        for _, copy in ipairs(copies) do
+            if copy[property] ~= value then
+                copy[property] = value
+            end
+        end
+    end
+end
+
+local function replaceTween(key, object, info, goals)
+    local old = visualTweens[key]
+    if old then
+        visualTweens[key] = nil
+        old:Cancel()
+        old:Destroy()
+    end
+    local tween = TweenService:Create(object, info, goals)
+    visualTweens[key] = tween
+    tween:Play()
+    return tween
+end
+
+local function label(parent, value, position, size, fontSize, color, font)
+    return make("TextLabel", parent, {
+        Position = position,
+        Size = size,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = value,
+        TextSize = fontSize or 12,
+        TextColor3 = color,
+        Font = font or Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        TextWrapped = true,
+        Active = false,
+        ZIndex = 3,
+    })
+end
+
+local function rule(parent, position, size, color, transparency)
+    local object = make("Frame", parent, {
+        Position = position,
+        Size = size,
+        BackgroundColor3 = color,
+        BackgroundTransparency = transparency or 0,
+        BorderSizePixel = 0,
+        Active = false,
+        ZIndex = 2,
+    })
+
+    local function isLineThickness(dimension)
+        return dimension.Scale == 0
+            and dimension.Offset > 0
+            and dimension.Offset <= 3
+    end
+
+    if isLineThickness(size.X) or isLineThickness(size.Y) then
+        object:SetAttribute("TransitionSkip", true)
+    end
+
+    return object
+end
+
+local function card(v, parent, position, size, color)
+    local object = make("Frame", parent, {
+        Position = position,
+        Size = size,
+        BackgroundColor3 = color or v.C.surface,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    })
+    corner(object, v.name == "MIDNIGHT" and 10 or 16)
+    stroke(object, v.C.border, 0.28)
+    return object
+end
+
+local function button(v, parent, value, position, size, command, argument)
+    local object = make("TextButton", parent, {
+        Position = position,
+        Size = size,
+        BackgroundColor3 = v.C.surface,
+        BorderSizePixel = 0,
+        Text = value,
+        TextColor3 = v.C.text,
+        TextSize = 12,
+        Font = v.name == "MIDNIGHT" and Enum.Font.GothamBold or Enum.Font.GothamMedium,
+        TextWrapped = true,
+        AutoButtonColor = false,
+        ZIndex = 4,
+    })
+    corner(object, v.name == "MIDNIGHT" and 9 or 12)
+    local outline = stroke(object, v.C.border, 0.25)
+    local feedback = stroke(object, v.C.secondary, 1, 2)
+    local scale = make("UIScale", object, {Scale = 1})
+    local record = {
+        object = object,
+        scale = scale,
+        outline = feedback,
+        hovered = false,
+    }
+    feedbackRecords[#feedbackRecords + 1] = record
+
+    local function animate(pressed)
+        if not S.alive then return end
+        replaceTween(scale, scale, TweenInfo.new(0.14), {
+            Scale = pressed and 0.982 or 1,
+        })
+        replaceTween(feedback, feedback, TweenInfo.new(0.16), {
+            Transparency = pressed and 0.1 or (record.hovered and 0.35 or 1),
+        })
+    end
+
+    connect(object.MouseEnter, function()
+        record.hovered = true
+        animate(false)
+    end)
+    connect(object.MouseLeave, function()
+        record.hovered = false
+        animate(false)
+    end)
+    connect(object.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(true)
+        end
+    end)
+    connect(object.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(false)
+        end
+    end)
+    connect(object.Activated, function()
+        if dispatch then dispatch(command, argument) end
+    end)
+    return object, outline
+end
+
+local function resetFeedback()
+    for _, record in ipairs(feedbackRecords) do
+        for _, key in ipairs({record.scale, record.outline}) do
+            local tween = visualTweens[key]
+            if tween then
+                visualTweens[key] = nil
+                tween:Cancel()
+                tween:Destroy()
+            end
+        end
+        record.hovered = false
+        record.scale.Scale = 1
+        record.outline.Transparency = 1
+    end
+end
+
+local gui = make("ScreenGui", playerGui, {
+    Name = GUI_NAME,
+    ResetOnSpawn = false,
+    DisplayOrder = 80,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+gui:SetAttribute("OutstandingUpgrade", false)
+
+local bounds = make("Frame", gui, {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+})
+
+local shell = make("Frame", bounds, {
+    Position = UDim2.fromOffset(20, 30),
+    Size = UDim2.fromOffset(460, 790),
+    BackgroundTransparency = 1,
+})
+
+local shellScale = make("UIScale", shell, {Scale = 1})
+
+for _, spec in ipairs({
+    {spread = 7, drop = 8, alpha = 0.94},
+    {spread = 3, drop = 6, alpha = 0.90},
+    {spread = 0, drop = 5, alpha = 0.76},
+}) do
+    local shadow = make("Frame", shell, {
+        Position = UDim2.fromOffset(-spec.spread, spec.drop - spec.spread),
+        Size = UDim2.new(1, spec.spread * 2, 1, spec.spread * 2),
+        BackgroundColor3 = Color3.fromRGB(6, 12, 20),
+        BackgroundTransparency = spec.alpha,
+        BorderSizePixel = 0,
+        ZIndex = 1,
+    })
+    corner(shadow, 20 + spec.spread)
+end
+
+-- The persistent theme selector remains usable during a reveal.
+local themeBar = make("Frame", shell, {
+    Size = UDim2.new(1, 0, 0, 50),
+    BackgroundColor3 = Color3.fromRGB(20, 28, 39),
+    BorderSizePixel = 0,
+    ZIndex = 30,
+})
+corner(themeBar, 12)
+stroke(themeBar, Color3.fromRGB(90, 107, 122), 0.55)
+
+local themeButtons = {}
+for index, entry in ipairs({
+    {"MIDNIGHT", "Midnight"},
+    {"IVORY", "Ivory"},
+    {"AUTO", "Automatic"},
+}) do
+    local object = make("TextButton", themeBar, {
+        Position = UDim2.new((index - 1) / 3, 5, 0, 3),
+        Size = UDim2.new(1 / 3, -10, 0, 44),
+        BackgroundColor3 = Color3.fromRGB(31, 42, 56),
+        BorderSizePixel = 0,
+        Text = entry[2],
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium,
+        TextColor3 = Color3.fromRGB(216, 226, 239),
+        AutoButtonColor = true,
+        ZIndex = 31,
+    })
+    corner(object, 9)
+    themeButtons[entry[1]] = object
+    connect(object.Activated, function()
+        if requestTheme then requestTheme(entry[1]) end
+    end)
+end
+
+local viewHost = make("Frame", shell, {
+    Position = UDim2.fromOffset(0, 56),
+    Size = UDim2.new(1, 0, 1, -56),
+    BackgroundTransparency = 1,
+    ClipsDescendants = true,
+    ZIndex = 3,
+})
+
+local function newView(name)
+    local v = {
+        name = name,
+        C = palettes[name],
+        cards = {},
+        pips = {{}, {}},
+        lights = {},
+    }
+
+    v.root = make("Frame", viewHost, {
+        Name = name,
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = v.C.bg,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Active = true,
+        ZIndex = 1,
+    })
+    corner(v.root, name == "MIDNIGHT" and 16 or 24)
+    local rootOutline = stroke(
+        v.root,
+        v.C.accent,
+        name == "MIDNIGHT" and 0.65 or 0.72
+    )
+    rootOutline:SetAttribute("TransitionSkip", true)
+    views[name] = v
+    return v
+end
+
+local function addLighting(v)
+    local dark = v.name == "MIDNIGHT"
+    local ambient = make("Frame", v.root, {
+        Name = "Atmosphere",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = dark and 0.70 or 0.12,
+        BorderSizePixel = 0,
+        Active = false,
+        Interactable = false,
+        ZIndex = 1,
+    })
+    corner(ambient, dark and 16 or 24)
+
+    local ambientGradient = make("UIGradient", ambient, {
+        Rotation = dark and 32 or 24,
+        Offset = Vector2.new(-1.2, -0.12),
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, v.C.secondary),
+            ColorSequenceKeypoint.new(0.5,
+                dark and Color3.fromRGB(201, 226, 255)
+                    or Color3.fromRGB(255, 253, 225)),
+            ColorSequenceKeypoint.new(1, v.C.accent),
+        }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.28, 1),
+            NumberSequenceKeypoint.new(0.42, 0.90),
+            NumberSequenceKeypoint.new(0.5, dark and 0.20 or 0.70),
+            NumberSequenceKeypoint.new(0.58, 0.90),
+            NumberSequenceKeypoint.new(0.72, 1),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+    })
+
+    local tween = TweenService:Create(
+        ambientGradient,
+        TweenInfo.new(dark and 14 or 13, Enum.EasingStyle.Sine,
+            Enum.EasingDirection.InOut, -1, true, 0.5),
+        {Offset = Vector2.new(1.2, 0.16)}
+    )
+    visualTweens[ambientGradient] = tween
+    v.lights[#v.lights + 1] = tween
+
+    if dark then
+        -- These HUD rails are decorative background elements. Mark them so
+        -- the cinematic slice renderer does not clone them once per slice;
+        -- doing so would multiply the rails into the visible line pattern
+        -- during the reveal. They remain part of the normal Midnight view.
+        for i = 1, 4 do
+            local rail = rule(v.root, UDim2.new(i / 5, 0, 0, 0),
+                UDim2.new(0, 1, 1, 0), v.C.accent, 0.96)
+            rail.ZIndex = 1
+            rail.Name = "HUDRailV" .. i
+            rail:SetAttribute("TransitionSkip", true)
+        end
+        for i = 1, 5 do
+            local rail = rule(v.root, UDim2.new(0, 0, i / 6, 0),
+                UDim2.new(1, 0, 0, 1), v.C.accent, 0.975)
+            rail.ZIndex = 1
+            rail.Name = "HUDRailH" .. i
+            rail:SetAttribute("TransitionSkip", true)
+        end
+    else
+        rule(v.root, UDim2.new(1, -30, 0, 103),
+            UDim2.new(0, 1, 1, -120), v.C.secondary, 0.86)
+    end
+end
+
+local function addHeader(v, height)
+    v.headerHeight = height
+    v.header = make("Frame", v.root, {
+        Size = UDim2.new(1, -110, 0, height),
+        BackgroundTransparency = 1,
+        Active = true,
+        ZIndex = 3,
+    })
+    v.collapse = button(v, v.root, "-", UDim2.new(1, -106, 0, 18),
+        UDim2.fromOffset(44, 44), "collapse")
+    v.close = button(v, v.root, "X", UDim2.new(1, -56, 0, 18),
+        UDim2.fromOffset(44, 44), "close")
+
+    v.divider = rule(v.root, UDim2.fromOffset(18, height),
+        UDim2.new(1, -36, 0, 1), v.C.border, 0.25)
+
+    v.body = make("ScrollingFrame", v.root, {
+        Position = UDim2.fromOffset(0, height + 12),
+        Size = UDim2.new(1, 0, 1, -(height + 42)),
+        CanvasSize = UDim2.fromOffset(0, 1000),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = v.C.accent,
+        ScrollBarImageTransparency = 0.25,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+        ZIndex = 3,
+    })
+
+    v.footer = label(v.root, "", UDim2.new(0, 18, 1, -26),
+        UDim2.new(1, -36, 0, 20), 9, v.C.muted,
+        v.name == "MIDNIGHT" and Enum.Font.Code or Enum.Font.GothamMedium)
+    v.footer.TextXAlignment = Enum.TextXAlignment.Right
+    v.footer.TextWrapped = false
+    v.footer.TextTruncate = Enum.TextTruncate.AtEnd
+
+    connect(v.header.InputBegan, function(input)
+        if dragInput or T.transition or not S.alive then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput, dragStart, panelStart = input, input.Position, shell.Position
+        end
+    end)
+end
+
+local function addPips(v, parent, firstY, gap, left, pipHeight)
+    for side = 1, 2 do
+        local y = firstY + (side - 1) * gap
+        label(parent, side == 1 and "TOP" or "BOTTOM",
+            UDim2.fromOffset(16, y - 3), UDim2.fromOffset(left - 20, 18),
+            9, v.C.muted, Enum.Font.Code)
+
+        local track = make("Frame", parent, {
+            Position = UDim2.fromOffset(left, y),
+            Size = UDim2.new(1, -(left + 16), 0, pipHeight),
+            BackgroundTransparency = 1,
+            ZIndex = 3,
+        })
+        for index = 1, 5 do
+            local pip = rule(track,
+                UDim2.new((index - 1) * 0.2, 0, 0, 0),
+                UDim2.new(0.2, -5, 1, 0), v.C.empty)
+            corner(pip, 3)
+            v.pips[side][index] = pip
+        end
+    end
+end
+
+local function addStatus(v, y, height)
+    v.statusCard = card(v, v.body, UDim2.fromOffset(18, y),
+        UDim2.new(1, -36, 0, height), v.C.note)
+    v.statusDot = rule(v.statusCard, UDim2.fromOffset(15, 17),
+        UDim2.fromOffset(6, 6), v.C.secondary)
+    corner(v.statusDot, 6)
+    v.statusHeading = label(v.statusCard, "READY",
+        UDim2.fromOffset(30, 10), UDim2.new(1, -44, 0, 20),
+        10, v.C.accent, Enum.Font.GothamBold)
+    v.statusText = label(v.statusCard, S.status,
+        UDim2.fromOffset(15, 36), UDim2.new(1, -30, 1, -45),
+        12, v.C.muted)
+    v.statusText.TextYAlignment = Enum.TextYAlignment.Top
+end
+
+local function constructMidnight()
+    local v = newView("MIDNIGHT")
+    local C = v.C
+    addLighting(v)
+    addHeader(v, 80)
+
+    local glow = rule(v.root, UDim2.fromOffset(16, 0),
+        UDim2.new(1, -32, 0, 2), Color3.new(1, 1, 1))
+    gradient(glow, C.accent, C.secondary)
+
+    local emblem = card(v, v.header, UDim2.fromOffset(16, 18),
+        UDim2.fromOffset(36, 38))
+    label(emblem, "M", UDim2.fromScale(0, 0), UDim2.fromScale(1, 1),
+        22, C.accent, Enum.Font.GothamBold).TextXAlignment =
+        Enum.TextXAlignment.Center
+
+    v.title = label(v.header, "MIDNIGHT", UDim2.fromOffset(63, 13),
+        UDim2.new(1, -68, 0, 25), 18, C.text, Enum.Font.GothamBold)
+    v.title.TextWrapped = false
+    v.title.TextTruncate = Enum.TextTruncate.AtEnd
+    label(v.header, "COMMAND / TDX", UDim2.fromOffset(64, 41),
+        UDim2.new(1, -69, 0, 19), 10, C.accent, Enum.Font.Code)
+
+    local function section(y, number, title, caption)
+        label(v.body, number, UDim2.fromOffset(18, y),
+            UDim2.fromOffset(26, 20), 11, C.accent, Enum.Font.Code)
+        label(v.body, title, UDim2.fromOffset(49, y),
+            UDim2.new(1, -67, 0, 20), 11, C.text, Enum.Font.GothamBold)
+        if caption then
+            label(v.body, caption, UDim2.fromOffset(49, y + 23),
+                UDim2.new(1, -67, 0, 20), 10, C.muted)
+        end
+    end
+
+    section(0, "01", "SELECTED ASSET")
+    local selected = card(v, v.body, UDim2.fromOffset(16, 31),
+        UDim2.new(1, -32, 0, 194))
+    gradient(selected, Color3.fromRGB(24, 43, 69),
+        Color3.fromRGB(12, 22, 39), 35)
+
+    v.ownership = label(selected, "", UDim2.fromOffset(16, 12),
+        UDim2.new(1, -32, 0, 18), 10, C.accent, Enum.Font.Code)
+    v.selected = label(selected, "", UDim2.fromOffset(16, 36),
+        UDim2.new(1, -32, 0, 32), 24, C.text, Enum.Font.GothamBold)
+    v.selected.TextWrapped = false
+    v.selected.TextTruncate = Enum.TextTruncate.AtEnd
+    v.level = label(selected, "", UDim2.fromOffset(16, 74),
+        UDim2.new(1, -32, 0, 18), 11, C.muted, Enum.Font.Code)
+    rule(selected, UDim2.fromOffset(16, 104),
+        UDim2.new(1, -32, 0, 1), C.border, 0.35)
+    addPips(v, selected, 120, 31, 72, 16)
+
+    local resources = card(v, v.body, UDim2.fromOffset(16, 235),
+        UDim2.new(1, -32, 0, 57))
+    rule(resources, UDim2.fromOffset(0, 14),
+        UDim2.fromOffset(2, 29), C.accent)
+    label(resources, "RESOURCES", UDim2.fromOffset(16, 8),
+        UDim2.new(0.43, -16, 0, 18), 10, C.muted, Enum.Font.GothamBold)
+    label(resources, "AVAILABLE CASH", UDim2.fromOffset(16, 29),
+        UDim2.new(0.43, -16, 0, 16), 9, C.muted, Enum.Font.Code)
+    v.cash = label(resources, "$0", UDim2.new(0.43, 0, 0, 0),
+        UDim2.new(0.57, -16, 1, 0), 23, C.text, Enum.Font.Code)
+    v.cash.TextXAlignment = Enum.TextXAlignment.Right
+    v.cash.TextWrapped = false
+    v.cash.TextTruncate = Enum.TextTruncate.AtEnd
+
+    section(310, "02", "BUILD DIRECTIVE", "Secondary path upgrades first.")
+    for i, path in ipairs(PATHS) do
+        local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+        local object, outline = button(v, v.body, "",
+            UDim2.new(col * 0.5, col == 0 and 16 or 5, 0, 362 + row * 108),
+            UDim2.new(0.5, -21, 0, 98), "path", i)
+        local title = label(object, path.name, UDim2.fromOffset(12, 10),
+            UDim2.new(1, -24, 0, 19), 10, C.muted, Enum.Font.GothamBold)
+        local value = label(object, path.a .. " / " .. path.b,
+            UDim2.fromOffset(12, 31), UDim2.new(1, -50, 0, 32),
+            27, C.text, Enum.Font.Code)
+        local mark = label(object, "", UDim2.new(1, -36, 0, 37),
+            UDim2.fromOffset(26, 18), 9, C.accent, Enum.Font.Code)
+        label(object, path.detail, UDim2.fromOffset(12, 72),
+            UDim2.new(1, -24, 0, 17), 10, C.muted)
+        local rail = rule(object, UDim2.fromOffset(12, 0),
+            UDim2.new(1, -24, 0, 2), C.accent, 1)
+        v.cards[i] = {
+            button = object, outline = outline, title = title,
+            value = value, mark = mark, rail = rail,
+        }
+    end
+
+    section(586, "03", "EXECUTION CONTROL")
+    v.action, v.actionOutline = button(v, v.body, "START UPGRADING",
+        UDim2.fromOffset(16, 617), UDim2.new(1, -32, 0, 56), "start")
+    v.action.BackgroundColor3 = Color3.new(1, 1, 1)
+    v.actionGradient = gradient(v.action, Color3.fromRGB(34, 83, 149),
+        Color3.fromRGB(46, 65, 115), 15)
+    v.cancel = button(v, v.body, "CANCEL", UDim2.fromOffset(16, 683),
+        UDim2.new(0.34, -19, 0, 48), "cancel")
+    v.auto, v.autoOutline = button(v, v.body, "AUTO / OFF",
+        UDim2.new(0.34, 5, 0, 683), UDim2.new(0.66, -21, 0, 48), "auto")
+    label(v.body, "AUTO / NEWLY OBSERVED ASSETS / 12s WINDOW",
+        UDim2.fromOffset(18, 738), UDim2.new(1, -36, 0, 23),
+        9, C.muted, Enum.Font.Code)
+    v.target, v.targetOutline = button(v, v.body, "TARGETING / OFF",
+        UDim2.fromOffset(16, 769), UDim2.new(1, -32, 0, 48), "target")
+    section(835, "04", "COMMAND LOG")
+    addStatus(v, 866, 106)
+    v.body.CanvasSize = UDim2.fromOffset(0, 990)
+
+    v.reflow = function(width)
+        v.title.TextSize = width < 350 and 14 or 18
+    end
+    return v
+end
+
+local function constructIvory()
+    local v = newView("IVORY")
+    local C = v.C
+    gradient(v.root, Color3.fromRGB(249, 246, 236),
+        Color3.fromRGB(235, 234, 219), 78)
+    addLighting(v)
+    addHeader(v, 96)
+
+    rule(v.root, UDim2.fromOffset(22, 0),
+        UDim2.fromOffset(58, 2), C.secondary, 0.15)
+    v.kicker = label(v.header, "TDX / CONTROL ATELIER",
+        UDim2.fromOffset(22, 13), UDim2.new(1, -28, 0, 17),
+        9, C.muted, Enum.Font.GothamMedium)
+    v.kicker.TextWrapped = false
+    v.kicker.TextTruncate = Enum.TextTruncate.AtEnd
+    v.title = label(v.header, "Ivory Studio", UDim2.fromOffset(20, 32),
+        UDim2.new(1, -26, 0, 38), 32, C.text, Enum.Font.Bodoni)
+    v.title.TextWrapped = false
+    v.title.TextTruncate = Enum.TextTruncate.AtEnd
+    v.subtitle = label(v.header, "A considered upgrade workspace",
+        UDim2.fromOffset(22, 74), UDim2.new(1, -28, 0, 15),
+        10, C.muted)
+    v.subtitle.TextWrapped = false
+    v.subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local selected = card(v, v.body, UDim2.fromOffset(18, 0),
+        UDim2.new(1, -36, 0, 218))
+    gradient(selected, Color3.fromRGB(255, 253, 245),
+        Color3.fromRGB(239, 243, 228), 70)
+    v.ownership = label(selected, "", UDim2.fromOffset(18, 16),
+        UDim2.new(1, -36, 0, 17), 9, C.accent, Enum.Font.GothamBold)
+    v.ownership.TextWrapped = false
+    v.ownership.TextTruncate = Enum.TextTruncate.AtEnd
+    v.selected = label(selected, "", UDim2.fromOffset(17, 39),
+        UDim2.new(1, -34, 0, 39), 29, C.text, Enum.Font.Bodoni)
+    v.selected.TextWrapped = false
+    v.selected.TextTruncate = Enum.TextTruncate.AtEnd
+    v.level = label(selected, "", UDim2.fromOffset(18, 82),
+        UDim2.new(1, -36, 0, 20), 12, C.muted)
+    rule(selected, UDim2.fromOffset(18, 115),
+        UDim2.new(1, -36, 0, 1), C.border, 0.25)
+    addPips(v, selected, 132, 24, 90, 10)
+
+    label(selected, "AVAILABLE CASH", UDim2.fromOffset(18, 184),
+        UDim2.new(0.45, -18, 0, 18), 9, C.muted)
+    v.cash = label(selected, "$0", UDim2.new(0.45, 0, 0, 178),
+        UDim2.new(0.55, -18, 0, 28), 20, C.accent,
+        Enum.Font.GothamMedium)
+    v.cash.TextXAlignment = Enum.TextXAlignment.Right
+    v.cash.TextWrapped = false
+    v.cash.TextTruncate = Enum.TextTruncate.AtEnd
+
+    label(v.body, "01", UDim2.fromOffset(22, 237),
+        UDim2.fromOffset(27, 23), 11, C.secondary)
+    label(v.body, "Build library", UDim2.fromOffset(55, 232),
+        UDim2.new(1, -78, 0, 32), 25, C.text, Enum.Font.Bodoni)
+    label(v.body, "Choose a destination. Secondary path upgrades first.",
+        UDim2.fromOffset(22, 269), UDim2.new(1, -44, 0, 30), 11, C.muted)
+
+    for i, path in ipairs(PATHS) do
+        local object, outline = button(v, v.body, "",
+            UDim2.fromOffset(18, 310 + (i - 1) * 68),
+            UDim2.new(1, -36, 0, 60), "path", i)
+        local rail = rule(object, UDim2.fromOffset(0, 17),
+            UDim2.fromOffset(3, 26), C.secondary, 0.8)
+        corner(rail, 2)
+        local number = label(object, string.format("%02d", i),
+            UDim2.fromOffset(14, 18), UDim2.fromOffset(25, 22),
+            10, C.muted)
+        local title = label(object, path.detail,
+            UDim2.fromOffset(49, 9), UDim2.new(1, -173, 0, 23),
+            13, C.text, Enum.Font.GothamMedium)
+        title.TextWrapped = false
+        title.TextTruncate = Enum.TextTruncate.AtEnd
+        local subtitle = label(object,
+            path.a > path.b and "TOP-FOCUSED PRESET" or "BOTTOM-FOCUSED PRESET",
+            UDim2.fromOffset(49, 34), UDim2.new(1, -173, 0, 15),
+            8, C.muted)
+        subtitle.TextWrapped = false
+        subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+        local value = label(object, path.a .. " / " .. path.b,
+            UDim2.new(1, -119, 0, 14), UDim2.fromOffset(65, 30),
+            25, C.text, Enum.Font.Bodoni)
+        value.TextXAlignment = Enum.TextXAlignment.Center
+        local mark = label(object, "", UDim2.new(1, -48, 0, 21),
+            UDim2.fromOffset(35, 18), 8, C.accent, Enum.Font.GothamBold)
+        mark.TextXAlignment = Enum.TextXAlignment.Center
+
+        v.cards[i] = {
+            button = object, outline = outline, rail = rail,
+            number = number, title = title, subtitle = subtitle,
+            value = value, mark = mark,
+        }
+    end
+
+    label(v.body, "02", UDim2.fromOffset(22, 591),
+        UDim2.fromOffset(27, 23), 11, C.secondary)
+    label(v.body, "Execution", UDim2.fromOffset(55, 586),
+        UDim2.new(1, -78, 0, 32), 25, C.text, Enum.Font.Bodoni)
+
+    v.action, v.actionOutline = button(v, v.body, "Begin upgrade",
+        UDim2.fromOffset(18, 630), UDim2.new(1, -36, 0, 58), "start")
+    v.action.BackgroundColor3 = Color3.new(1, 1, 1)
+    v.action.TextColor3 = Color3.fromRGB(255, 251, 240)
+    v.action.TextSize = 15
+    v.actionGradient = gradient(v.action, Color3.fromRGB(48, 76, 56),
+        Color3.fromRGB(81, 111, 80), 15)
+    v.auto, v.autoOutline = button(v, v.body, "Auto / Off",
+        UDim2.fromOffset(18, 700), UDim2.new(0.5, -24, 0, 54), "auto")
+    v.target, v.targetOutline = button(v, v.body, "Targeting / Off",
+        UDim2.new(0.5, 6, 0, 700), UDim2.new(0.5, -24, 0, 54), "target")
+    v.cancel = button(v, v.body, "Cancel",
+        UDim2.fromOffset(18, 766), UDim2.new(1, -36, 0, 48), "cancel")
+    addStatus(v, 830, 105)
+    v.autoNote = label(v.body,
+        "AUTO / Select a newly observed owned tower within 12 seconds.",
+        UDim2.fromOffset(22, 950), UDim2.new(1, -44, 0, 32),
+        10, C.muted)
+
+    v.reflow = function(width)
+        local narrow = width < 370
+        v.title.TextSize = narrow and 27 or 32
+        v.kicker.TextSize = narrow and 8 or 9
+        v.subtitle.Visible = width >= 320
+        v.selected.TextSize = narrow and 26 or 29
+
+        for _, item in ipairs(v.cards) do
+            item.number.Visible = not narrow
+            local left = narrow and 15 or 49
+            item.title.Position = UDim2.fromOffset(left, 9)
+            item.title.Size = UDim2.new(1, -(left + 124), 0, 23)
+            item.subtitle.Position = UDim2.fromOffset(left, 34)
+            item.subtitle.Size = UDim2.new(1, -(left + 124), 0, 15)
+        end
+
+        if narrow then
+            v.auto.Position = UDim2.fromOffset(18, 700)
+            v.auto.Size = UDim2.new(1, -36, 0, 48)
+            v.target.Position = UDim2.fromOffset(18, 758)
+            v.target.Size = UDim2.new(1, -36, 0, 48)
+            v.cancel.Position = UDim2.fromOffset(18, 818)
+            v.statusCard.Position = UDim2.fromOffset(18, 882)
+            v.autoNote.Position = UDim2.fromOffset(22, 1002)
+            v.body.CanvasSize = UDim2.fromOffset(0, 1048)
+        else
+            v.auto.Position = UDim2.fromOffset(18, 700)
+            v.auto.Size = UDim2.new(0.5, -24, 0, 54)
+            v.target.Position = UDim2.new(0.5, 6, 0, 700)
+            v.target.Size = UDim2.new(0.5, -24, 0, 54)
+            v.cancel.Position = UDim2.fromOffset(18, 766)
+            v.statusCard.Position = UDim2.fromOffset(18, 830)
+            v.autoNote.Position = UDim2.fromOffset(22, 950)
+            v.body.CanvasSize = UDim2.fromOffset(0, 996)
+        end
+    end
+    return v
+end
+
+constructMidnight()
+constructIvory()
+
+local function message(value, bad)
+    if not S.alive then return end
+    S.status, S.bad = value, bad == true
+end
+
+local function outstanding()
+    S.outstanding = S.uncertain ~= nil or (S.job ~= nil and S.job.pending ~= nil)
+    gui:SetAttribute("OutstandingUpgrade", S.outstanding)
+end
+
+local function current()
+    local tower = API.UI.GetCurrentTower()
+    if tower and API.Towers.GetTower(tower.Hash) == tower then
+        return tower
+    end
+end
+
+local function cash()
+    local wrapper = API.Players.GetLocalPlayerWrapper()
+    local value = wrapper and wrapper.Stats and wrapper.Stats:GetCash()
+    if value == nil then return 0 end
+    assert(type(value) == "number" and value == value
+        and math.abs(value) < math.huge, "Invalid client cash.")
+    return value
+end
+
+local function selectionProblem(tower)
+    if not tower then return "Select a tower first." end
+    if API.Towers.GetTower(tower.Hash) ~= tower then
+        return "Tower no longer exists."
+    end
+    if not tower.OwnedByLocalPlayer then return "This tower is not yours." end
+    if workspace:GetAttribute("FPSMode") or API.Input.GetState() ~= "Normal" then
+        return "Finish placement, aiming, or direct control."
+    end
+    if not tower:Alive() then return "Tower is not alive." end
+    if tower:IsRebuilding() then return "Tower is rebuilding." end
+    if tower:IsReviving() then return "Tower is reviving." end
+end
+
+local function upgradeProblem(tower)
+    local why = selectionProblem(tower)
+    if why then return why end
+    if S.uncertain then
+        return "Previous outcome unknown. Waiting for a level update."
+    end
+    if tower.AbilityHandler and not tower.AbilityHandler:CanUpgrade() then
+        return "Cannot upgrade during this ability."
+    end
+end
+
+local function nextStep(tower, path)
+    local lh = tower.LevelHandler
+    local data = lh:GetUpgradePathData()
+    local a, b = lh:GetLevelOnPath(1), lh:GetLevelOnPath(2)
+
+    if data.OnePathOnly then
+        return nil, "This preset needs a two-path tower."
+    end
+    if a > path.a or b > path.b then
+        return nil, "Cannot downgrade to this preset."
+    end
+    if path.a > #data.Path1Data or path.b > #data.Path2Data then
+        return nil, "Preset unavailable."
+    end
+
+    local lock = lh:GetPathLockLevel()
+    if path.a >= lock and path.b >= lock then
+        return nil, "Paths conflict."
+    end
+    local major = path.a > path.b and 1 or 2
+    local lockedPath = lh:GetPath()
+    if lockedPath ~= 0 and lockedPath ~= major then
+        return nil, "Opposite path locked."
+    end
+    if a == path.a and b == path.b then
+        return nil, nil, true
+    end
+
+    local side, before
+    if major == 1 then
+        if b < path.b then
+            side, before = 2, b
+        else
+            side, before = 1, a
+        end
+    else
+        if a < path.a then
+            side, before = 1, a
+        else
+            side, before = 2, b
+        end
+    end
+
+    if before + 1 > lh:GetMaxPossibleLevel(side) then
+        return nil, "Path locked."
+    end
+
+    local cost = lh:GetLevelUpgradeCost(side, 1,
+        tower.BuffHandler:GetDiscount(),
+        API.Game.GetTowerCostMultiplier(tower.Type),
+        tower:GetDynamicPriceScalingData())
+
+    if type(cost) ~= "number" or cost ~= cost or cost < 0 or cost == math.huge then
+        return nil, "Price unavailable."
+    end
+    return {side = side, level = before + 1, cost = cost}
+end
+
+local function finish(value, bad)
+    S.job = nil
+    outstanding()
+    message(value, bad)
+end
+
+local function tickUncertain()
+    local record = S.uncertain
+    if not record then return end
+    local tower, pending = record.tower, record.pending
+
+    if API.Towers.GetTower(tower.Hash) ~= tower then
+        S.uncertain = nil
+        outstanding()
+        message("Tower removed. Unresolved tower request cleared.")
+    elseif tower.LevelHandler:GetLevelOnPath(pending.side) >= pending.level then
+        S.uncertain = nil
+        outstanding()
+        message("Late level update received. Review before restarting.")
+    end
+end
+
+local function tickJob()
+    local job = S.job
+    if not job then return end
+    local tower = job.tower
+
+    if API.Towers.GetTower(tower.Hash) ~= tower then
+        finish("Tower removed; stopped.", true)
+        return
+    end
+    if API.UI.GetCurrentTower() ~= tower then
+        job.cancelReason = job.cancelReason or "Selection changed."
+    end
+
+    local pending = job.pending
+    if pending then
+        if tower.LevelHandler:GetLevelOnPath(pending.side) >= pending.level then
+            job.pending = nil
+            outstanding()
+        elseif os.clock() >= pending.deadline then
+            S.uncertain = {tower = tower, pending = pending}
+            S.auto = false
+            table.clear(S.fresh)
+            finish("Outcome UNKNOWN. Auto stopped; no retry issued.", true)
+            return
+        else
+            return
+        end
+    end
+
+    if job.cancelReason then
+        finish(job.cancelReason .. " Completed purchases remain.")
+        return
+    end
+
+    local why = upgradeProblem(tower)
+    if why then
+        finish(why, true)
+        return
+    end
+
+    local step, stepError, done = nextStep(tower, job.path)
+    if done then
+        finish(string.format("Build complete. Reached %d-%d.", job.path.a, job.path.b))
+        return
+    end
+    if not step then
+        finish(stepError, true)
+        return
+    end
+
+    local balance = cash()
+    if balance < step.cost then
+        message(string.format("Waiting for %d more cash.", math.ceil(step.cost - balance)))
+        return
+    end
+    if API.UI.GetCurrentTower() ~= tower then
+        finish("Selection changed.")
+        return
+    end
+
+    job.pending = {
+        side = step.side,
+        level = step.level,
+        deadline = os.clock() + ACK_TIMEOUT,
+    }
+    outstanding()
+    API.Upgrade:Fire(step.side, false)
+    message(string.format("Path %d -> %d. Waiting for level update.", step.side, step.level))
+end
+
+local function guarded(callback)
+    if not S.alive or S.busy or S.faulted then return end
+    S.busy = true
+    local ok, failure = xpcall(callback, debug.traceback)
+    S.busy = false
+    if ok then return end
+
+    if S.job and S.job.pending then
+        S.uncertain = {tower = S.job.tower, pending = S.job.pending}
+    end
+    S.job, S.auto, S.targetAuto, S.faulted = nil, false, false, true
+    table.clear(S.fresh)
+    outstanding()
+    message("Client contract error. Worker stopped; see console.", true)
+    warn("[TDX] " .. tostring(failure))
+end
+
+local function start(fromAuto)
+    if S.job or S.uncertain or S.closing then return end
+    local tower = current()
+    local why = upgradeProblem(tower)
+    if why then
+        message(why, true)
+        return
+    end
+    S.fresh[tower] = nil
+    S.job = {tower = tower, path = PATHS[S.path]}
+    message(fromAuto and "Auto started." or "Started.")
+    tickJob()
+end
+
+local scanElapsed = 0
+
+local function observeTower(tower, now)
+    if not tower or S.seen[tower] then return end
+    S.seen[tower] = true
+    if S.auto and tower.OwnedByLocalPlayer then
+        S.fresh[tower] = now + AUTO_WINDOW
+    end
+end
+
+local function tickAuto(dt)
+    if not S.auto or S.closing or S.uncertain then return end
+    local now, tower = os.clock(), current()
+    observeTower(tower, now)
+    scanElapsed = scanElapsed + dt
+
+    if scanElapsed >= 0.15 then
+        scanElapsed = 0
+        for _, item in pairs(API.Towers.GetTowers()) do
+            observeTower(item, now)
+        end
+        for item in pairs(S.seen) do
+            if API.Towers.GetTower(item.Hash) ~= item then
+                S.seen[item], S.fresh[item] = nil, nil
+            end
+        end
+        for item, deadline in pairs(S.fresh) do
+            if now > deadline then S.fresh[item] = nil end
+        end
+    end
+
+    if tower and not S.job then
+        local deadline = S.fresh[tower]
+        if deadline and now <= deadline and not upgradeProblem(tower) then
+            S.fresh[tower] = nil
+            start(true)
+        end
+    end
+end
+
+local function tickTargeting()
+    if not S.targetAuto or S.closing or S.uncertain or S.outstanding then return end
+    local tower = current()
+    if not tower or S.targeted[tower] or selectionProblem(tower) then return end
+    S.targeted[tower] = true
+    API.Target:Fire()
+end
+
+local function money(value)
+    local result = tostring(math.floor(value))
+    local count
+    repeat
+        result, count = result:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+    until count == 0
+    return "$" .. result
+end
+
+local function sampleDisplay()
+    local tower = current()
+    local a, b = 0, 0
+    if tower then
+        a, b = tower.LevelHandler:GetLevelOnPath(1), tower.LevelHandler:GetLevelOnPath(2)
+    end
+    local balance = cash()
+    S.display = {
+        selected = tower ~= nil,
+        name = tower and tostring(tower.Type) or "Choose a tower",
+        owned = tower ~= nil and tower.OwnedByLocalPlayer == true,
+        a = a,
+        b = b,
+        cash = balance,
+    }
+end
+
+local function renderView(v)
+    local C, D = v.C, S.display
+    local dark = v.name == "MIDNIGHT"
+    local locked = S.job ~= nil or S.uncertain ~= nil or S.closing or S.faulted
+    local state = S.faulted and "CLIENT ERROR"
+        or S.closing and "CLOSING"
+        or S.uncertain and "OUTCOME UNKNOWN"
+        or S.job and (S.job.pending and "AWAITING CONFIRMATION" or "RUNNING")
+        or S.auto and "AUTO ARMED"
+        or "STANDBY"
+
+    set(v.selected, "Text", D.selected and D.name
+        or (dark and "Select a tower" or "Choose a tower"))
+    set(v.ownership, "Text", D.selected
+        and (D.owned
+            and (dark and "SELECTION / YOUR TOWER" or "YOUR WORKSPACE / OWNED TOWER")
+            or (dark and "SELECTION / NOT OWNED" or "VIEW ONLY / NOT YOUR TOWER"))
+        or (dark and "SELECTION / IDLE" or "YOUR WORKSPACE / NO SELECTION"))
+    set(v.ownership, "TextColor3", D.selected and not D.owned and C.danger or C.accent)
+    set(v.level, "Text", string.format(
+        dark and "TOP %d  /  BOTTOM %d" or "Top %d  /  Bottom %d", D.a, D.b))
+    set(v.cash, "Text", money(D.cash))
+
+    for side = 1, 2 do
+        local level = side == 1 and D.a or D.b
+        for index, pip in ipairs(v.pips[side]) do
+            set(pip, "BackgroundColor3", index <= level
+                and (side == 1 and C.accent or C.secondary) or C.empty)
+        end
+    end
+
+    for i, item in ipairs(v.cards) do
+        local selected = i == S.path
+        set(item.button, "BackgroundColor3", selected and C.selected or C.surface)
+        set(item.outline, "Color", selected and C.accent or C.border)
+        set(item.outline, "Transparency", selected and 0.12 or 0.35)
+        set(item.title, "TextColor3", selected and C.accent or (dark and C.muted or C.text))
+        set(item.title, "TextTransparency", locked and 0.2 or 0)
+        set(item.value, "TextTransparency", locked and 0.25 or 0)
+        set(item.value, "TextColor3", selected and C.accent or C.text)
+        set(item.mark, "Text", selected and (dark and "ON" or "SET") or "")
+        set(item.rail, "BackgroundColor3", selected and C.accent or C.secondary)
+        set(item.rail, "BackgroundTransparency", selected and 0.05 or (dark and 1 or 0.8))
+        if item.number then
+            set(item.number, "TextColor3", selected and C.accent or C.muted)
+        end
+    end
+
+    local actionText = S.faulted and "Stopped / client error"
+        or S.closing and "Closing after request settles"
+        or S.uncertain and "Outcome unknown / waiting"
+        or S.job and (S.job.pending
+            and "Upgrading / waiting for update" or "Running / waiting for cash")
+        or (dark and "Start upgrading" or "Begin upgrade")
+
+    set(v.action, "Text", dark and string.upper(actionText) or actionText)
+    set(v.actionGradient, "Enabled", not (S.faulted or S.uncertain or S.closing))
+    set(v.action, "BackgroundColor3", (S.faulted or S.uncertain or S.closing)
+        and (dark and C.surface2 or C.muted) or Color3.new(1, 1, 1))
+
+    local cancelText = S.job and S.job.cancelReason and "Stopping" or "Cancel"
+    set(v.cancel, "Text", dark and string.upper(cancelText) or cancelText)
+    set(v.cancel, "TextColor3", S.job and C.danger or C.muted)
+
+    local autoText = S.auto and "Auto / On" or "Auto / Off"
+    local targetText = S.targetAuto and "Targeting / On - once per tower" or "Targeting / Off"
+    set(v.auto, "Text", dark and string.upper(autoText) or autoText)
+    set(v.target, "Text", dark and string.upper(targetText) or targetText)
+    set(v.auto, "BackgroundColor3", S.auto and C.selected or C.surface)
+    set(v.target, "BackgroundColor3", S.targetAuto and C.selected or C.surface)
+    set(v.auto, "TextColor3", S.auto and C.green or C.text)
+    set(v.target, "TextColor3", S.targetAuto and C.green or C.text)
+    set(v.autoOutline, "Color", S.auto and C.accent or C.border)
+    set(v.targetOutline, "Color", S.targetAuto and C.accent or C.border)
+
+    set(v.statusText, "Text", S.status)
+    set(v.statusText, "TextColor3", (S.bad or S.faulted) and C.danger or C.muted)
+    set(v.statusHeading, "Text", dark and ("SYSTEM / " .. state)
+        or (state == "STANDBY" and "WORKSPACE NOTE" or state))
+    set(v.statusHeading, "TextColor3", (S.bad or S.faulted) and C.danger or C.accent)
+    set(v.statusDot, "BackgroundColor3", (S.bad or S.faulted) and C.danger
+        or S.job and C.green or C.secondary)
+    set(v.statusCard, "BackgroundColor3", (S.bad or S.faulted) and C.dangerSoft
+        or (S.uncertain or S.closing) and C.warning or C.note)
+    set(v.footer, "Text", (dark and "TDX / CLIENT OPERATIONS  |  "
+        or "IVORY STUDIO / TDX  |  ") .. state)
+    set(v.footer, "TextColor3", (S.bad or S.faulted) and C.danger or C.muted)
+end
+
+local function render()
+    renderView(views.MIDNIGHT)
+    renderView(views.IVORY)
+end
+
+local function updateThemeButtons()
+    local destination = T.current
+    if T.transition then
+        destination = T.transition.to == 1
+            and T.transition.incoming or T.transition.outgoing
+    end
+    for name, object in pairs(themeButtons) do
+        local selected = name == "AUTO" and T.automatic
+            or name ~= "AUTO" and not T.automatic and name == destination
+        object.BackgroundColor3 = selected
+            and Color3.fromRGB(67, 88, 111) or Color3.fromRGB(31, 42, 56)
+        object.TextTransparency = THEME_SETTINGS.Enabled and 0 or 0.45
+    end
+end
+
+local function resetThemeDeadline()
+    T.deadline = os.clock() + (T.current == "MIDNIGHT"
+        and THEME_SETTINGS.MidnightDuration or THEME_SETTINGS.IvoryDuration)
+end
+
+local function syncLighting()
+    for name, v in pairs(views) do
+        local active = not S.collapsed and not T.transition and name == T.current
+        for _, tween in ipairs(v.lights) do
+            if active then tween:Play() else tween:Pause() end
+        end
+    end
+end
+
+local function destroyTransition()
+    local tr = T.transition
+    T.transition = nil
+    table.clear(T.mirrors)
+    if tr and tr.layer then tr.layer:Destroy() end
+    for name, v in pairs(views) do
+        v.root.Visible = name == T.current
+        v.body.ScrollingEnabled = true
+    end
+end
+
+local function settleTransition()
+    local tr = T.transition
+    if not tr then return end
+    T.current = tr.to == 1 and tr.incoming or tr.outgoing
+    destroyTransition()
+    resetThemeDeadline()
+    updateThemeButtons()
+    syncLighting()
+end
+
+-- Clone only an object's own properties. Children are visited selectively
+-- afterward, so every slice excludes unrelated off-slice UI branches.
+local function shallowClone(source)
+    local children = source:GetChildren()
+    local saved = {}
+    for i, item in ipairs(children) do
+        saved[i] = item.Archivable
+        item.Archivable = false
+    end
+    local originalArchivable = source.Archivable
+    source.Archivable = true
+    local ok, copy = pcall(function() return source:Clone() end)
+    source.Archivable = originalArchivable
+    for i, item in ipairs(children) do
+        item.Archivable = saved[i]
+    end
+    if not ok then error(copy) end
+    assert(copy, "Could not create transition slice.")
+    return copy, children
+end
+
+local function cloneSliceBranch(source, parent, top, bottom, clipTop, clipBottom)
+    -- Decorative elements explicitly marked as transition-excluded should
+    -- stay out of per-slice clones. This prevents full-panel rails/grids from
+    -- being duplicated once for every reveal slice.
+    if source:GetAttribute("TransitionSkip") then return nil end
+
+    if source:IsA("GuiObject") then
+        if not source.Visible then return nil end
+        local y = source.AbsolutePosition.Y
+        local h = source.AbsoluteSize.Y
+        if y + h < top - 3 or y > bottom + 3
+            or y + h < clipTop or y > clipBottom then
+            return nil
+        end
+    end
+
+    local copy, children = shallowClone(source)
+    copy.Parent = parent
+
+    local copies = T.mirrors[source]
+    if not copies then
+        copies = {}
+        T.mirrors[source] = copies
+    end
+    copies[#copies + 1] = copy
+
+    local nextTop, nextBottom = clipTop, clipBottom
+    if source:IsA("GuiObject") then
+        copy.Active = false
+        copy.Interactable = false
+        copy.Selectable = false
+        if source.ClipsDescendants or source:IsA("ScrollingFrame") then
+            nextTop = math.max(nextTop, source.AbsolutePosition.Y)
+            nextBottom = math.min(nextBottom,
+                source.AbsolutePosition.Y + source.AbsoluteSize.Y)
+        end
+    end
+
+    for _, item in ipairs(children) do
+        if item:IsA("GuiObject") then
+            if nextBottom >= top and nextTop <= bottom then
+                cloneSliceBranch(item, copy, top, bottom, nextTop, nextBottom)
+            end
+        elseif not item:IsA("LuaSourceContainer")
+            and not item:GetAttribute("TransitionSkip") then
+            -- UIStroke, UICorner, UIGradient, UIScale and other UI components
+            -- have no event handlers in their clones.
+            local component = item:Clone()
+            if component then
+                component.Parent = copy
+                local componentCopies = T.mirrors[item]
+                if not componentCopies then
+                    componentCopies = {}
+                    T.mirrors[item] = componentCopies
+                end
+                componentCopies[#componentCopies + 1] = component
+            end
+        end
+    end
+    return copy
+end
+
+local function drawTransition(tr)
+    local width, height = T.width, T.height
+    local skew = math.min(110, width * 0.24)
+    local margin = 52
+    local center = -skew / 2 - margin
+        + tr.p * (width + skew + margin * 2)
+
+    for _, slice in ipairs(tr.slices) do
+        local boundary = center + skew * (slice.middle / height - 0.5)
+        slice.mask.Size = UDim2.fromOffset(
+            math.clamp(boundary, 0, width), slice.height)
+    end
+
+    -- This diagonal beam covers only the small stair-step approximation at
+    -- the mask edge. The mask, not beam transparency, reveals the new view.
+    tr.beam.Position = UDim2.fromOffset(center, height / 2)
+    tr.beam.Rotation = -math.deg(math.atan(skew / height))
+end
+
+local function beginTransition(destination)
+    if destination == T.current or T.transition or not S.alive then return end
+    resetFeedback()
+    dragInput = nil
+
+    local tr = {
+        outgoing = T.current,
+        incoming = destination,
+        p = 0,
+        from = 0,
+        to = 1,
+        started = os.clock(),
+        duration = THEME_SETTINGS.TransitionDuration,
+        slices = {},
+    }
+    T.transition = tr
+    table.clear(T.mirrors)
+    syncLighting()
+
+    tr.layer = make("CanvasGroup", viewHost, {
+        Name = "CinematicReveal",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        ClipsDescendants = true,
+        GroupTransparency = 0,
+        Active = true,
+        ZIndex = 20,
+    })
+
+    local incoming = views[destination]
+    local outgoing = views[T.current]
+    incoming.root.Visible = true
+    incoming.root.ZIndex = 1
+    outgoing.root.Visible = true
+    outgoing.root.ZIndex = 2
+
+    for _, v in pairs(views) do v.body.ScrollingEnabled = false end
+
+    local count = math.clamp(math.ceil(T.height / 12), 8, 72)
+    local originY = incoming.root.AbsolutePosition.Y
+
+    -- Extend each slice into the next by two screen pixels.
+    -- Adjacent copies remain aligned to the same full-panel coordinates,
+    -- so the overlap covers clipping seams without shifting the content.
+    local overlap = 2 / math.max(T.scale, 0.01)
+
+    for index = 1, count do
+        local y0 = math.floor((index - 1) * T.height / count)
+        local y1 = math.floor(index * T.height / count)
+
+        -- Preserve the original band for the diagonal calculation.
+        -- Extend only its rendered/clipped coverage.
+        local coveredBottom = math.min(T.height, y1 + overlap)
+        local h = coveredBottom - y0
+
+        local mask = make("Frame", tr.layer, {
+            Name = "RevealSlice",
+            Position = UDim2.fromOffset(0, y0),
+            Size = UDim2.fromOffset(0, h),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ClipsDescendants = true,
+            Active = false,
+            Interactable = false,
+            ZIndex = 1,
+        })
+
+        local physicalTop = originY + y0 * T.scale
+        local physicalBottom = originY + coveredBottom * T.scale
+        local copy = cloneSliceBranch(incoming.root, mask,
+            physicalTop, physicalBottom,
+            originY, originY + T.height * T.scale)
+
+        assert(copy, "Incoming view has no measurable transition bounds.")
+        copy.AnchorPoint = Vector2.new(0, 0)
+        copy.Position = UDim2.fromOffset(0, -y0)
+        copy.Size = UDim2.fromOffset(T.width, T.height)
+        copy.Visible = true
+        copy.ZIndex = 1
+
+        tr.slices[#tr.slices + 1] = {
+            mask = mask,
+            height = h,
+            middle = (y0 + y1) / 2,
+        }
+    end
+
+    incoming.root.Visible = false
+
+    tr.beam = make("Frame", tr.layer, {
+        Name = "DiagonalBoundaryLight",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(76, T.height * 1.8 + 240),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Active = false,
+        Interactable = false,
+        ZIndex = 10,
+    })
+
+    make("UIGradient", tr.beam, {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(130, 168, 255)),
+            ColorSequenceKeypoint.new(0.40, Color3.fromRGB(216, 232, 255)),
+            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 255, 245)),
+            ColorSequenceKeypoint.new(0.60, Color3.fromRGB(255, 241, 202)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(191, 208, 246)),
+        }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.20, 0.97),
+            NumberSequenceKeypoint.new(0.36, 0.80),
+            NumberSequenceKeypoint.new(0.46, 0.32),
+            NumberSequenceKeypoint.new(0.49, 0.02),
+            NumberSequenceKeypoint.new(0.51, 0.02),
+            NumberSequenceKeypoint.new(0.54, 0.32),
+            NumberSequenceKeypoint.new(0.64, 0.80),
+            NumberSequenceKeypoint.new(0.80, 0.97),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+    })
+
+    -- Input shield prevents interaction with visible-but-partially-clipped
+    -- controls. The separate theme bar remains interactive for reversal.
+    make("TextButton", tr.layer, {
+        Name = "TransitionInputShield",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        Active = true,
+        Selectable = false,
+        ZIndex = 30,
+    })
+
+    tr.started = os.clock()
+    drawTransition(tr)
+    updateThemeButtons()
+end
+
+local function visualFailure(failure)
+    local tr = T.transition
+    if tr then T.current = tr.outgoing end
+    destroyTransition()
+    T.automatic = false
+    updateThemeButtons()
+    syncLighting()
+    warn("[TDX] Theme transition stopped: " .. tostring(failure))
+end
+
+requestTheme = function(mode)
+    if not S.alive or not THEME_SETTINGS.Enabled then return end
+    if mode ~= "MIDNIGHT" and mode ~= "IVORY" and mode ~= "AUTO" then return end
+
+    if mode == "AUTO" then
+        T.automatic = true
+        resetThemeDeadline()
+        updateThemeButtons()
+        return
+    end
+
+    T.automatic = false
+    local tr = T.transition
+    if tr then
+        local goal = mode == tr.incoming and 1 or 0
+        if goal ~= tr.to then
+            tr.from = tr.p
+            tr.to = goal
+            tr.started = os.clock()
+            tr.duration = math.max(0.12,
+                THEME_SETTINGS.TransitionDuration * math.abs(goal - tr.p))
+        end
+        updateThemeButtons()
+        return
+    end
+
+    resetThemeDeadline()
+    local ok, failure = xpcall(function()
+        beginTransition(mode)
+    end, debug.traceback)
+    if not ok then visualFailure(failure) end
+    updateThemeButtons()
+end
+
+local function tickTheme()
+    local tr = T.transition
+    if tr then
+        local alpha = math.clamp((os.clock() - tr.started) / tr.duration, 0, 1)
+        local eased = 0.5 - math.cos(alpha * math.pi) * 0.5
+        tr.p = tr.from + (tr.to - tr.from) * eased
+        drawTransition(tr)
+        if alpha >= 1 then settleTransition() end
+    elseif THEME_SETTINGS.Enabled and T.automatic
+        and not S.closing and os.clock() >= T.deadline then
+        beginTransition(T.current == "MIDNIGHT" and "IVORY" or "MIDNIGHT")
+    end
+end
+
+fit = function()
+    if not S.alive then return end
+    local size = bounds.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return end
+
+    local availableWidth = math.max(1, size.X - 20)
+    local availableHeight = math.max(1, size.Y - 20)
+    local scale = math.min(1, availableWidth / 280, availableHeight / 205)
+    scale = math.max(0.01, scale)
+
+    local width = math.min(460, availableWidth / scale)
+    local totalHeight = S.collapsed and 152
+        or math.min(846, availableHeight / scale)
+    local height = math.max(1, totalHeight - 56)
+
+    local dimensionsChanged = width ~= T.width or height ~= T.height or scale ~= T.scale
+    if dimensionsChanged and T.transition then
+        -- A viewport resize commits the currently requested destination.
+        -- No stale-size masks survive into the new layout.
+        settleTransition()
+    end
+
+    T.width, T.height, T.scale = width, height, scale
+    shellScale.Scale = scale
+    shell.Size = UDim2.fromOffset(width, totalHeight)
+    shell.Position = UDim2.fromOffset(
+        math.clamp(shell.Position.X.Offset, 0, math.max(0, size.X - width * scale)),
+        math.clamp(shell.Position.Y.Offset, 0,
+            math.max(0, size.Y - totalHeight * scale - 7))
+    )
+
+    for _, v in pairs(views) do
+        v.body.Visible = not S.collapsed
+        v.divider.Visible = not S.collapsed
+        v.footer.Visible = not S.collapsed
+        v.collapse.Text = S.collapsed and "+" or "-"
+        v.reflow(width)
+    end
+    syncLighting()
+end
+
+cleanup = function(destroyGui)
+    if not S.alive then return end
+    S.alive, S.auto, S.targetAuto = false, false, false
+    T.automatic = false
+    dragInput = nil
+
+    if S.outstanding then
+        warn("[TDX] Removed with an unresolved request. Removal does not cancel server processing.")
+    end
+
+    for _, connection in ipairs(S.connections) do
+        connection:Disconnect()
+    end
+    table.clear(S.connections)
+
+    for key, tween in pairs(visualTweens) do
+        visualTweens[key] = nil
+        tween:Cancel()
+        tween:Destroy()
+    end
+
+    local tr = T.transition
+    T.transition = nil
+    table.clear(T.mirrors)
+    if tr and tr.layer then tr.layer:Destroy() end
+
+    table.clear(feedbackRecords)
+    table.clear(S.seen)
+    table.clear(S.fresh)
+    table.clear(S.targeted)
+    S.job, S.uncertain = nil, nil
+    table.clear(views)
+    table.clear(themeButtons)
+    if destroyGui then gui:Destroy() end
+end
+
+requestClose = function(reason)
+    if not S.alive then return end
+    S.auto, S.targetAuto = false, false
+    T.automatic = false
+    table.clear(S.fresh)
+    dragInput = nil
+
+    outstanding()
+    if S.outstanding then
+        S.closing = true
+        if S.job then
+            S.job.cancelReason = reason or "Close requested."
+        end
+        message(
+            S.uncertain
+                and "Close queued. Outcome unknown; waiting for a level update."
+                or "Close queued. Waiting for the outstanding purchase.",
+            S.uncertain ~= nil
+        )
+        updateThemeButtons()
+    else
+        cleanup(true)
+    end
+end
+
+dispatch = function(command, argument)
+    if not S.alive then return end
+
+    if command == "close" then
+        requestClose("Close requested.")
+        return
+    end
+
+    if T.transition then return end
+
+    if command == "collapse" then
+        dragInput = nil
+        resetFeedback()
+        S.collapsed = not S.collapsed
+        fit()
+        return
+    end
+
+    if command == "cancel" then
+        if S.job then
+            S.job.cancelReason = S.job.cancelReason or "Canceled."
+            message("Stopping after any outstanding purchase settles.")
+            guarded(tickJob)
+        elseif S.uncertain then
+            message("Outcome unknown. Cancel cannot undo a dispatched request.", true)
+        elseif not S.closing then
+            message("No active upgrade job.")
+        end
+        return
+    end
+
+    guarded(function()
+        if S.closing then return end
+
+        if command == "path" then
+            if S.job or S.uncertain then return end
+            if type(argument) ~= "number" or not PATHS[argument] then return end
+            S.path = argument
+            message(PATHS[argument].name
+                .. " selected. Secondary path upgrades first.")
+
+        elseif command == "start" then
+            start(false)
+
+        elseif command == "auto" then
+            if S.uncertain then
+                message("Resolve the previous outcome before enabling Auto.", true)
+                return
+            end
+
+            S.auto = not S.auto
+            table.clear(S.fresh)
+            table.clear(S.seen)
+            scanElapsed = 0
+
+            if S.auto then
+                for _, tower in pairs(API.Towers.GetTowers()) do
+                    S.seen[tower] = true
+                end
+                local tower = current()
+                if tower then S.seen[tower] = true end
+            end
+
+            message(S.auto
+                and "Auto: select a newly observed owned tower within 12 seconds."
+                or "Auto OFF. Existing job unchanged; Cancel stops it.")
+
+        elseif command == "target" then
+            if S.uncertain then
+                message("Resolve the previous outcome before enabling targeting.", true)
+                return
+            end
+            S.targetAuto = not S.targetAuto
+            message(S.targetAuto
+                and "Targeting: cycles C once per selected owned tower."
+                or "Automatic targeting disabled.")
+        end
+    end)
+end
+
+connect(UIS.InputChanged, function(input)
+    if not S.alive or not dragInput or T.transition then return end
+    if input == dragInput or (
+        dragInput.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseMovement
+    ) then
+        local delta = input.Position - dragStart
+        local size = bounds.AbsoluteSize
+        shell.Position = UDim2.fromOffset(
+            math.clamp(
+                panelStart.X.Offset + delta.X,
+                0,
+                math.max(0, size.X - T.width * T.scale)
+            ),
+            math.clamp(
+                panelStart.Y.Offset + delta.Y,
+                0,
+                math.max(0, size.Y - shell.Size.Y.Offset * T.scale - 7)
+            )
+        )
+    end
+end)
+
+connect(UIS.InputEnded, function(input)
+    if not S.alive then return end
+    if input == dragInput or (
+        dragInput
+        and dragInput.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseButton1
+    ) then
+        dragInput, dragStart, panelStart = nil, nil, nil
+    end
+end)
+
+connect(UIS.WindowFocusReleased, function()
+    if not S.alive then return end
+    dragInput, dragStart, panelStart = nil, nil, nil
+    resetFeedback()
+end)
+
+connect(bounds:GetPropertyChangedSignal("AbsoluteSize"), function()
+    if not S.alive then return end
+    dragInput, dragStart, panelStart = nil, nil, nil
+    fit()
+end)
+
+connect(gui.Destroying, function()
+    cleanup(false)
+end)
+
+connect(gui.AncestryChanged, function()
+    if S.alive and not gui:IsDescendantOf(playerGui) then
+        cleanup(true)
+    end
+end)
+
+connect(player.CharacterRemoving, function()
+    requestClose("Character removed.")
+end)
+
+local originalInterface = playerGui:FindFirstChild("Interface")
+connect(playerGui.ChildRemoved, function(item)
+    if originalInterface and item == originalInterface then
+        requestClose("Game interface removed.")
+    end
+end)
+
+local uiElapsed = 0.15
+local uncertainReadFailed = false
+local presentationFailed = false
+
+local function renderSafely()
+    if not S.alive or presentationFailed then return end
+    local ok, failure = xpcall(render, debug.traceback)
+    if ok then return end
+
+    -- Discard any broken mirrors before trying the persistent views.
+    visualFailure(failure)
+    local recovered, renderError = xpcall(render, debug.traceback)
+    if not recovered then
+        presentationFailed = true
+        S.auto, S.targetAuto = false, false
+        table.clear(S.fresh)
+        if S.job then
+            S.job.cancelReason = "Presentation stopped."
+        end
+        warn("[TDX] Presentation stopped: " .. tostring(renderError))
+        requestClose("Presentation stopped.")
+    end
+end
+
+-- One heartbeat owns gameplay progression, display sampling, and the reveal.
+-- Theme animation never starts another gameplay worker.
+connect(RunService.Heartbeat, function(dt)
+    if not S.alive then return end
+
+    if not S.faulted then
+        guarded(function()
+            if S.uncertain then
+                tickUncertain()
+            elseif S.job then
+                tickJob()
+            end
+
+            if S.closing then return end
+
+            tickAuto(dt)
+
+            local ok, failure = pcall(tickTargeting)
+            if not ok then
+                S.targetAuto = false
+                message("Automatic targeting stopped; see console.", true)
+                warn("[TDX] " .. tostring(failure))
+            end
+        end)
+    elseif S.uncertain and not uncertainReadFailed and not S.busy then
+        -- A fault never authorizes another purchase. Only reconcile the
+        -- request already dispatched, using the existing read-only check.
+        S.busy = true
+        local ok, failure = pcall(tickUncertain)
+        S.busy = false
+        if not ok then
+            uncertainReadFailed = true
+            message("Client error; outcome unknown. No retry issued.", true)
+            warn("[TDX] " .. tostring(failure))
+        end
+    end
+
+    if not S.alive then return end
+    if S.closing and not S.outstanding and not S.busy then
+        cleanup(true)
+        return
+    end
+
+    uiElapsed = uiElapsed + dt
+    if uiElapsed >= 0.15 then
+        uiElapsed = 0
+        if not S.faulted then
+            guarded(sampleDisplay)
+        end
+        renderSafely()
+    end
+
+    if not S.alive then return end
+
+    local ok, failure = xpcall(function()
+        tickTheme()
+
+        local tr = T.transition
+        if tr and tr.beam then
+            -- Feather the light at either endpoint, including reversals.
+            -- The slice masks remain opaque: this fades only the beam,
+            -- never the outgoing or incoming presentation.
+            local edge = math.min(tr.p, 1 - tr.p)
+            tr.beam.BackgroundTransparency =
+                1 - math.clamp(edge / 0.065, 0, 1)
+        end
+    end, debug.traceback)
+
+    if not ok then
+        visualFailure(failure)
+    end
+end)
+
+-- Initialize both existing presentations before permitting automatic changes.
+-- Their controls already share dispatch; no additional control connections
+-- or view construction is needed here.
+destroyTransition()
+fit()
+resetThemeDeadline()
+updateThemeButtons()
+guarded(sampleDisplay)
+renderSafely()
+
+if S.alive then
+    syncLighting()
+    if not S.faulted then
+        print("[TDX] Midnight + Ivory loaded. One shared gameplay worker; "
+            .. "server/client purchase limits still apply.")
+    end
+end
