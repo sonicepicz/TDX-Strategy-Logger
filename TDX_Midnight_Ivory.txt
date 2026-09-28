@@ -2384,6 +2384,20 @@ local function cloneSliceBranch(
         return nil
     end
 
+    -- The full-panel outline belongs to the persistent view, not
+    -- to every clipped copy of that view.
+    --
+    -- Keep interior card/button strokes and all animated decoration.
+    -- Do not globally reject TransitionSkip: the current renderer
+    -- intentionally mirrors the atmosphere and material effects.
+    if source:IsA("UIStroke") then
+        local owner = source.Parent
+        if owner == views.MIDNIGHT.root
+            or owner == views.IVORY.root then
+            return nil
+        end
+    end
+
     local isGui = source:IsA("GuiObject")
     local nextTop, nextBottom = clipTop, clipBottom
 
@@ -2598,12 +2612,12 @@ local function beginTransition(destination)
 
     syncLighting()
 
-    tr.layer = make("CanvasGroup", viewHost, {
+    tr.layer = make("Frame", viewHost, {
         Name = "CinematicReveal",
         Size = UDim2.fromScale(1, 1),
         BackgroundTransparency = 1,
+        BorderSizePixel = 0,
         ClipsDescendants = true,
-        GroupTransparency = 0,
         Active = true,
         ZIndex = 20,
     })
@@ -2617,12 +2631,46 @@ local function beginTransition(destination)
 
     for _, v in pairs(views) do v.body.ScrollingEnabled = false end
 
-    local count = math.clamp(math.ceil(T.height / 12), 8, 72)
     local originY = incoming.root.AbsolutePosition.Y
-    local screenScale = math.max(T.scale, 0.01)
 
-    -- Adjacent bands share exactly the same boundary.
-    -- Interior boundaries are aligned to screen pixels where possible.
+    -- Measure the actual logical-to-screen conversion.
+    -- This includes scaling inherited from ancestors, rather than
+    -- assuming that shellScale is the only scale in the hierarchy.
+    local measuredHeight = incoming.root.AbsoluteSize.Y
+    local screenScale = measuredHeight / math.max(T.height, 0.001)
+
+    assert(
+        screenScale == screenScale
+            and screenScale > 0
+            and screenScale < math.huge,
+        "Incoming view has no measurable transition scale."
+    )
+
+    local physicalHeight = T.height * screenScale
+    local desiredCount = math.clamp(
+        math.ceil(T.height / 12),
+        8,
+        72
+    )
+
+    -- Extremely small rendered panels must not create more bands
+    -- than they have physical pixel rows.
+    local count = math.max(
+        1,
+        math.min(
+            desiredCount,
+            math.floor(physicalHeight)
+        )
+    )
+
+    -- Small intentional overlap prevents fractional clipping edges
+    -- from exposing the outgoing theme between horizontal bands.
+    --
+    -- Each copy contains the same opaque root background and uses
+    -- the same content origin, so the overlap replaces pixels;
+    -- it does not brighten translucent decoration underneath.
+    local seamOverlap = 1 / screenScale
+
     local function sliceEdge(index)
         if index <= 0 then
             return 0
@@ -2631,9 +2679,12 @@ local function beginTransition(destination)
         end
 
         local logicalY = index * T.height / count
-        local screenY = originY + logicalY / screenScale
+
+        -- Logical -> screen: MULTIPLY by scale.
+        local screenY = originY + logicalY * screenScale
         local snappedScreenY = math.floor(screenY + 0.5)
 
+        -- Screen -> logical: DIVIDE by scale.
         return math.clamp(
             (snappedScreenY - originY) / screenScale,
             0,
@@ -2645,39 +2696,69 @@ local function beginTransition(destination)
         local y0 = sliceEdge(index - 1)
         local y1 = sliceEdge(index)
 
-        local coveredBottom = y1
-        local h = y1 - y0
+        -- Skip any degenerate interval caused by pixel snapping.
+        if y1 > y0 then
+            local coveredBottom = math.min(
+                T.height,
+                y1 + seamOverlap
+            )
+            local maskHeight = coveredBottom - y0
 
-        local mask = make("Frame", tr.layer, {
-            Name = "RevealSlice",
-            Position = UDim2.fromOffset(0, y0),
-            Size = UDim2.fromOffset(0, h),
-            BackgroundTransparency = 1,
-            BorderSizePixel = 0,
-            ClipsDescendants = true,
-            Active = false,
-            Interactable = false,
-            ZIndex = 1,
-        })
+            local mask = make("Frame", tr.layer, {
+                Name = "RevealSlice",
+                Position = UDim2.fromOffset(0, y0),
+                Size = UDim2.fromOffset(0, maskHeight),
+                BackgroundTransparency = 1,
+                BorderSizePixel = 0,
+                ClipsDescendants = true,
+                Active = false,
+                Interactable = false,
+                Selectable = false,
 
-        local physicalTop = originY + y0 * T.scale
-        local physicalBottom = originY + coveredBottom * T.scale
-        local copy = cloneSliceBranch(incoming.root, mask,
-            physicalTop, physicalBottom,
-            originY, originY + T.height * T.scale)
+                -- Lower bands deterministically cover the small
+                -- overlap from the band immediately above them.
+                ZIndex = index,
+            })
 
-        assert(copy, "Incoming view has no measurable transition bounds.")
-        copy.AnchorPoint = Vector2.new(0, 0)
-        copy.Position = UDim2.fromOffset(0, -y0)
-        copy.Size = UDim2.fromOffset(T.width, T.height)
-        copy.Visible = true
-        copy.ZIndex = 1
+            local physicalTop = originY + y0 * screenScale
+            local physicalBottom =
+                originY + coveredBottom * screenScale
 
-        tr.slices[#tr.slices + 1] = {
-            mask = mask,
-            height = h,
-            middle = (y0 + y1) / 2,
-        }
+            local copy = cloneSliceBranch(
+                incoming.root,
+                mask,
+                physicalTop,
+                physicalBottom,
+                originY,
+                originY + physicalHeight
+            )
+
+            assert(
+                copy,
+                "Incoming view has no measurable transition bounds."
+            )
+
+            copy.AnchorPoint = Vector2.new(0, 0)
+            copy.Position = UDim2.fromOffset(0, -y0)
+            copy.Size = UDim2.fromOffset(T.width, T.height)
+            copy.Visible = true
+            copy.ZIndex = 1
+
+            -- An opaque foundation makes overlapping slices safe.
+            -- Transparency within cards and decorative surfaces
+            -- remains unchanged.
+            copy.BackgroundTransparency = 0
+            copy.BorderSizePixel = 0
+
+            tr.slices[#tr.slices + 1] = {
+                mask = mask,
+                height = maskHeight,
+
+                -- Use the nominal band center for the diagonal,
+                -- not the extended overlap region.
+                middle = (y0 + y1) * 0.5,
+            }
+        end
     end
 
     -- All incoming copies now exist. Register only the animated
@@ -2695,7 +2776,7 @@ local function beginTransition(destination)
         BorderSizePixel = 0,
         Active = false,
         Interactable = false,
-        ZIndex = 10,
+        ZIndex = 100,
     })
 
     make("UIGradient", tr.beam, {
@@ -2730,7 +2811,7 @@ local function beginTransition(destination)
         AutoButtonColor = false,
         Active = true,
         Selectable = false,
-        ZIndex = 30,
+        ZIndex = 110,
     })
 
     tr.started = os.clock()
