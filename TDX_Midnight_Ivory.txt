@@ -148,6 +148,176 @@ local S = {
     },
 }
 
+-- Keep extension helpers in one namespace to avoid adding many chunk locals.
+local X = {
+    historyLimit = 20,
+    sampleLimit = 50,
+
+    timelineOpen = false,
+    recoveryDismissed = false,
+    recoveryDetails = false,
+    recoveryRecord = nil,
+
+    qualityMode = "AUTO",
+    quality = 3,
+    qualityEMA = 1 / 60,
+    qualityElapsed = 0,
+    qualityChangedAt = 0,
+    qualityDirty = true,
+    qualityObjects = {},
+    qualityTweens = {},
+
+    compactVisibility = nil,
+    compactMoved = false,
+
+    scenarios = {
+        "Normal", "Instant", "Delayed", "Slow", "Timeout",
+        "Late confirmation", "Insufficient cash", "Selection change",
+        "Tower removal", "Cancellation", "Path restriction", "12-pass bound",
+    },
+
+    sim = {
+        enabled = false,
+        scenarioIndex = 1,
+        tower = nil,
+        selected = nil,
+        cash = 0,
+        scheduled = nil,
+        event = nil,
+        removed = false,
+        dispatches = 0,
+        confirmations = 0,
+    },
+}
+
+S.upgradeTelemetry = {
+    startedAt = nil,
+    completed = 0,
+    total = nil,
+    current = nil,
+    next = nil,
+    state = "Idle",
+    lastLatency = nil,
+    averageLatency = nil,
+    rollingLatency = nil,
+    maximumLatency = nil,
+    latencyCount = 0,
+    samples = {},
+    history = {},
+    revision = 0,
+    simulated = false,
+    lastTickPasses = 0,
+    maximumTickPasses = 0,
+}
+
+function X.event(kind, text, tower, pending)
+    local t = S.upgradeTelemetry
+    local simulated = pending and pending.simulated
+    if simulated == nil then
+        simulated = tower and tower == X.sim.tower or X.sim.enabled
+    end
+
+    local entry = {
+        timestamp = os.clock(),
+        type = kind,
+        message = tostring(text),
+        tower = tower and tostring(tower.Type) or nil,
+        path = pending and pending.side or nil,
+        level = pending and pending.level or nil,
+        simulated = simulated == true,
+    }
+
+    local history = t.history
+    if #history >= X.historyLimit then
+        table.remove(history, 1)
+    end
+    history[#history + 1] = entry
+    t.revision = t.revision + 1
+end
+
+function X.state(value, kind, text, tower, pending)
+    local t = S.upgradeTelemetry
+    if t.state == value then return end
+    t.state = value
+    t.revision = t.revision + 1
+    if kind then
+        X.event(kind, text or value, tower, pending)
+    end
+end
+
+function X.levelText(tower)
+    if not tower then return "-" end
+    return string.format("%d-%d",
+        tower.LevelHandler:GetLevelOnPath(1),
+        tower.LevelHandler:GetLevelOnPath(2))
+end
+
+function X.beginTelemetry(job)
+    local t = S.upgradeTelemetry
+    local lh = job.tower.LevelHandler
+    local a, b = lh:GetLevelOnPath(1), lh:GetLevelOnPath(2)
+
+    t.startedAt = os.clock()
+    t.completed = 0
+    t.total = math.max(0, job.path.a - a) + math.max(0, job.path.b - b)
+    t.current = string.format("%d-%d", a, b)
+    t.next = nil
+    t.simulated = job.simulated
+    t.lastTickPasses = 0
+    t.maximumTickPasses = 0
+
+    X.state(job.simulated and "Simulation" or "Starting")
+    X.event("Job started",
+        string.format("%s: %s -> %d-%d; estimated %d purchases",
+            tostring(job.tower.Type), t.current,
+            job.path.a, job.path.b, t.total),
+        job.tower)
+end
+
+function X.confirm(tower, pending, late)
+    if pending.telemetryConfirmed then return end
+    pending.telemetryConfirmed = true
+
+    local t = S.upgradeTelemetry
+    local latency = math.max(0, os.clock() - pending.sentAt)
+    t.lastLatency = latency
+    t.latencyCount = t.latencyCount + 1
+    t.averageLatency = (t.averageLatency or 0)
+        + (latency - (t.averageLatency or 0)) / t.latencyCount
+    t.maximumLatency = math.max(t.maximumLatency or 0, latency)
+
+    local samples = t.samples
+    if #samples >= X.sampleLimit then
+        table.remove(samples, 1)
+    end
+    samples[#samples + 1] = latency
+
+    local sum = 0
+    for _, value in ipairs(samples) do
+        sum = sum + value
+    end
+    t.rollingLatency = sum / #samples
+    t.completed = t.completed + 1
+    t.current = X.levelText(tower)
+    t.next = nil
+
+    X.event(late and "Late confirmation" or "Upgrade confirmed",
+        string.format("%s confirmed; observed confirmation latency %.3fs",
+            t.current, latency),
+        tower, pending)
+end
+
+function X.detectRecovery(record)
+    if X.recoveryRecord == record then return end
+    X.recoveryRecord = record
+    X.recoveryDismissed = false
+    X.recoveryDetails = false
+    X.state("Uncertain")
+    X.event("Recovery detected",
+        "Upgrade outcome unknown. Read-only reconciliation; no retry.",
+        record.tower, record.pending)
+end
+
 local function positive(value, fallback, minimum)
     if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
         return fallback
@@ -567,7 +737,9 @@ local function tickIvoryPresentation(dt)
     for _, entry in ipairs(state.surfaces) do
         local weight = entry.weight and entry.weight.Value or 1
         local pulse = entry.pulse and entry.pulse.Value or 1
-        local opacity = (1 - entry.alpha) * state.gain * weight * pulse
+        local qualityGain = X.quality == 3 and 1
+            or X.quality == 2 and 0.78 or 0.55
+        local opacity = (1 - entry.alpha) * state.gain * weight * pulse * qualityGain
         local alpha = 1 - math.clamp(opacity, 0, 1)
 
         if math.abs(entry.object[entry.property] - alpha) > 0.0005 then
@@ -1844,6 +2016,99 @@ end
 constructMidnight()
 constructIvory()
 
+function X.buildExtensionUI(v)
+    local panel = card(v, v.body, UDim2.fromOffset(18, 0),
+        UDim2.new(1, -36, 0, 402))
+    v.extension = panel
+
+    v.progress = label(panel, "", UDim2.fromOffset(12, 8),
+        UDim2.new(1, -24, 0, 50), 12, v.C.text, Enum.Font.GothamMedium)
+
+    v.latency = label(panel, "", UDim2.fromOffset(12, 60),
+        UDim2.new(1, -24, 0, 46), 10, v.C.muted)
+
+    v.simToggle = button(v, panel, "SIMULATION / OFF",
+        UDim2.fromOffset(12, 112), UDim2.new(1, -24, 0, 44), "simulation")
+
+    v.simScenario = button(v, panel, "",
+        UDim2.fromOffset(12, 162), UDim2.new(1, -24, 0, 44), "scenario")
+
+    v.simReset = button(v, panel, "Reset fixture",
+        UDim2.fromOffset(12, 212), UDim2.new(0.5, -18, 0, 44), "simReset")
+    v.simCash = button(v, panel, "+1000 virtual cash",
+        UDim2.new(0.5, 6, 0, 212), UDim2.new(0.5, -18, 0, 44), "simCash")
+
+    v.qualityButton = button(v, panel, "",
+        UDim2.fromOffset(12, 262), UDim2.new(1, -24, 0, 44), "quality")
+
+    v.timelineButton = button(v, panel, "Activity / Show",
+        UDim2.fromOffset(12, 312), UDim2.new(0.5, -18, 0, 44), "timeline")
+    v.recoveryButton = button(v, panel, "Recovery",
+        UDim2.new(0.5, 6, 0, 312), UDim2.new(0.5, -18, 0, 44), "recovery")
+
+    v.simNote = label(panel, "", UDim2.fromOffset(12, 360),
+        UDim2.new(1, -24, 0, 34), 9, v.C.muted)
+
+    v.timeline = make("ScrollingFrame", panel, {
+        Position = UDim2.fromOffset(12, 402),
+        Size = UDim2.new(1, -24, 0, 180),
+        CanvasSize = UDim2.fromOffset(0, 600),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = v.C.accent,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        Visible = false,
+        ZIndex = 4,
+    })
+    v.timelineText = label(v.timeline, "",
+        UDim2.fromOffset(0, 0), UDim2.new(1, -8, 0, 600),
+        10, v.C.muted, Enum.Font.Code)
+    v.timelineText.TextYAlignment = Enum.TextYAlignment.Top
+
+    -- Root-level recovery overlay: visible without scrolling to diagnostics.
+    v.recoveryPanel = card(v, v.root,
+        UDim2.new(0, 12, 0.5, -140),
+        UDim2.new(1, -24, 0, 280), v.C.warning)
+    v.recoveryPanel.ZIndex = 12
+    v.recoveryPanel.Visible = false
+
+    label(v.recoveryPanel, "UPGRADE OUTCOME UNKNOWN",
+        UDim2.fromOffset(14, 10), UDim2.new(1, -28, 0, 30),
+        13, v.C.danger, Enum.Font.GothamBold)
+
+    v.recoveryText = label(v.recoveryPanel, "",
+        UDim2.fromOffset(14, 45), UDim2.new(1, -28, 0, 128),
+        11, v.C.text)
+    v.recoveryText.TextYAlignment = Enum.TextYAlignment.Top
+
+    button(v, v.recoveryPanel, "Re-check",
+        UDim2.fromOffset(12, 181), UDim2.new(0.5, -18, 0, 44), "recheck")
+    button(v, v.recoveryPanel, "Details",
+        UDim2.new(0.5, 6, 0, 181), UDim2.new(0.5, -18, 0, 44), "details")
+    button(v, v.recoveryPanel, "Dismiss panel - keep safety lock",
+        UDim2.fromOffset(12, 231), UDim2.new(1, -24, 0, 40), "dismissRecovery")
+
+    local originalReflow = v.reflow
+    local fixedBase = v.body.CanvasSize.Y.Offset
+
+    v.reflow = function(width)
+        -- Ivory's original reflow chooses its narrow/wide canvas height.
+        -- Midnight's original reflow does not set CanvasSize.
+        v.body.CanvasSize = UDim2.fromOffset(0, fixedBase)
+        originalReflow(width)
+        local base = v.body.CanvasSize.Y.Offset
+        local height = X.timelineOpen and 594 or 402
+        v.extensionBase = base
+        set(panel, "Position", UDim2.fromOffset(18, base + 8))
+        set(panel, "Size", UDim2.new(1, -36, 0, height))
+        set(v.body, "CanvasSize", UDim2.fromOffset(0, base + height + 24))
+    end
+end
+
+X.buildExtensionUI(views.MIDNIGHT)
+X.buildExtensionUI(views.IVORY)
+
 local function message(value, bad)
     if not S.alive then return end
     S.status, S.bad = value, bad == true
@@ -1854,14 +2119,263 @@ local function outstanding()
     gui:SetAttribute("OutstandingUpgrade", S.outstanding)
 end
 
+function X.pumpSimulation()
+    local sim = X.sim
+    if not sim.enabled then return end
+
+    local now = os.clock()
+    local event = sim.event
+    if event and now >= event.at then
+        sim.event = nil
+
+        if event.kind == "selection" then
+            sim.selected = nil
+            X.event("Simulation event", "Virtual selection changed.", sim.tower)
+        elseif event.kind == "removal" then
+            sim.removed = true
+            sim.selected = nil
+            X.event("Simulation event", "Virtual tower removed.", sim.tower)
+        elseif event.kind == "cancel" then
+            if S.job and S.job.tower == sim.tower then
+                S.job.cancelReason = "Canceled."
+            end
+            X.event("Simulation event", "Virtual cancellation requested.", sim.tower)
+        end
+    end
+
+    local scheduled = sim.scheduled
+    if scheduled and now >= scheduled.at then
+        sim.scheduled = nil
+        if not sim.removed then
+            local lh = sim.tower.LevelHandler
+            lh.levels[scheduled.side] =
+                math.max(lh.levels[scheduled.side], scheduled.level)
+            sim.confirmations = sim.confirmations + 1
+        end
+    end
+end
+
+function X.exists(tower)
+    if not tower then return false end
+    if tower == X.sim.tower then
+        X.pumpSimulation()
+        return X.sim.enabled and not X.sim.removed
+    end
+    if X.sim.enabled then return false end
+    return API.Towers.GetTower(tower.Hash) == tower
+end
+
+function X.selected()
+    if X.sim.enabled then
+        X.pumpSimulation()
+        return X.sim.selected
+    end
+    return API.UI.GetCurrentTower()
+end
+
+function X.towers()
+    if X.sim.enabled then
+        if X.sim.tower and not X.sim.removed then
+            return {X.sim.tower}
+        end
+        return {}
+    end
+    return API.Towers.GetTowers()
+end
+
+function X.resetSimulation()
+    assert(not S.job and not S.uncertain and not S.outstanding,
+        "Cannot reset simulation while a request is unresolved.")
+
+    local sim = X.sim
+    local scenario = X.scenarios[sim.scenarioIndex]
+    local maximum = scenario == "12-pass bound" and 20 or 5
+    local data = {
+        OnePathOnly = scenario == "Path restriction",
+        Path1Data = {},
+        Path2Data = {},
+    }
+
+    for i = 1, maximum do
+        data.Path1Data[i] = {}
+        data.Path2Data[i] = {}
+    end
+
+    local lh = {
+        levels = {0, 0},
+    }
+
+    function lh:GetUpgradePathData()
+        return data
+    end
+
+    function lh:GetLevelOnPath(side)
+        X.pumpSimulation()
+        return self.levels[side]
+    end
+
+    function lh:GetPathLockLevel()
+        return 3
+    end
+
+    function lh:GetPath()
+        if self.levels[1] >= 3 then return 1 end
+        if self.levels[2] >= 3 then return 2 end
+        return 0
+    end
+
+    function lh:GetMaxPossibleLevel(side)
+        local other = side == 1 and 2 or 1
+        return self.levels[other] >= 3 and 2 or maximum
+    end
+
+    function lh:GetLevelUpgradeCost(side, count, discount, multiplier, scaling)
+        -- Deterministic fixture prices, not a claim about live TDX prices.
+        return (100 + self.levels[side] * 50) * multiplier
+    end
+
+    local tower = {
+        Hash = "LOCALSIMULATIONONLY",
+        Type = "SIM / " .. scenario,
+        OwnedByLocalPlayer = true,
+        LevelHandler = lh,
+        BuffHandler = {
+            GetDiscount = function() return 0 end,
+        },
+    }
+
+    function tower:Alive()
+        return not sim.removed
+    end
+
+    function tower:IsRebuilding()
+        return false
+    end
+
+    function tower:IsReviving()
+        return false
+    end
+
+    function tower:GetDynamicPriceScalingData()
+        return nil
+    end
+
+    sim.tower = tower
+    sim.selected = tower
+    sim.removed = false
+    sim.scheduled = nil
+    sim.event = nil
+    sim.dispatches = 0
+    sim.confirmations = 0
+    sim.cash = scenario == "Insufficient cash" and 0 or 100000
+    sim.pathOverride = scenario == "12-pass bound"
+        and {name = "SIM BOUND TEST", a = 20, b = 2} or nil
+
+    S.auto, S.targetAuto = false, false
+    table.clear(S.seen)
+    table.clear(S.fresh)
+    table.clear(S.targeted)
+
+    local t = S.upgradeTelemetry
+    t.startedAt = nil
+    t.completed, t.total = 0, nil
+    t.current, t.next = "0-0", nil
+    t.simulated = true
+    t.lastLatency, t.averageLatency = nil, nil
+    t.rollingLatency, t.maximumLatency = nil, nil
+    t.latencyCount = 0
+    table.clear(t.samples)
+
+    X.state("Simulation")
+    X.event("Simulation event",
+        "Fixture ready: " .. scenario .. ". No real upgrade dispatch.", tower)
+end
+
+function X.sendUpgrade(job, step)
+    local pending = job.pending
+    assert(pending, "Dispatch requires a registered pending request.")
+    assert(job.simulated == X.sim.enabled,
+        "Upgrade mode changed during an active job.")
+    assert(pending.simulated == job.simulated,
+        "Pending upgrade mode mismatch.")
+
+    -- Timestamp immediately before dispatch. No waits are introduced.
+    pending.sentAt = os.clock()
+    pending.deadline = pending.sentAt + ACK_TIMEOUT
+
+    if job.simulated then
+        -- SIMULATION BRANCH: never reaches the real API dispatch below.
+        local sim = X.sim
+        assert(sim.enabled and job.tower == sim.tower,
+            "Invalid virtual upgrade target.")
+        assert(X.exists(job.tower) and X.selected() == job.tower,
+            "Virtual selection changed before dispatch.")
+        assert(not sim.scheduled, "Duplicate virtual pending request.")
+        assert(sim.cash >= step.cost, "Insufficient virtual cash.")
+
+        sim.cash = sim.cash - step.cost
+        sim.dispatches = sim.dispatches + 1
+
+        local scenario = X.scenarios[sim.scenarioIndex]
+        local delay = 0.12
+        if scenario == "Instant" or scenario == "12-pass bound" then
+            delay = 0
+        elseif scenario == "Delayed" then
+            delay = 0.8
+        elseif scenario == "Slow" then
+            delay = ACK_TIMEOUT * 0.75
+        elseif scenario == "Timeout" then
+            delay = math.huge
+        elseif scenario == "Late confirmation" then
+            delay = ACK_TIMEOUT + 1.5
+        elseif scenario == "Selection change"
+            or scenario == "Tower removal"
+            or scenario == "Cancellation" then
+            delay = 0.35
+        end
+
+        sim.scheduled = {
+            side = step.side,
+            level = step.level,
+            at = pending.sentAt + delay,
+        }
+
+        if sim.dispatches == 1 then
+            local kind = scenario == "Selection change" and "selection"
+                or scenario == "Tower removal" and "removal"
+                or scenario == "Cancellation" and "cancel"
+            if kind then
+                sim.event = {kind = kind, at = pending.sentAt + 0.05}
+            end
+        end
+
+        X.pumpSimulation()
+        return
+    end
+
+    -- REAL BRANCH: the only API.Upgrade:Fire call in the patched script.
+    assert(not X.sim.enabled and job.tower ~= X.sim.tower,
+        "Real dispatch blocked for simulation.")
+    assert(API.Towers.GetTower(job.tower.Hash) == job.tower,
+        "Real tower disappeared before dispatch.")
+    assert(API.UI.GetCurrentTower() == job.tower,
+        "Real selection changed before dispatch.")
+
+    API.Upgrade:Fire(step.side, false)
+end
+
 local function current()
-    local tower = API.UI.GetCurrentTower()
-    if tower and API.Towers.GetTower(tower.Hash) == tower then
+    local tower = X.selected()
+    if tower and X.exists(tower) then
         return tower
     end
 end
 
 local function cash()
+    if X.sim.enabled then
+        return X.sim.cash
+    end
+
     local wrapper = API.Players.GetLocalPlayerWrapper()
     local value = wrapper and wrapper.Stats and wrapper.Stats:GetCash()
     if value == nil then return 0 end
@@ -1872,13 +2386,19 @@ end
 
 local function selectionProblem(tower)
     if not tower then return "Select a tower first." end
-    if API.Towers.GetTower(tower.Hash) ~= tower then
+    if not X.exists(tower) then
         return "Tower no longer exists."
     end
     if not tower.OwnedByLocalPlayer then return "This tower is not yours." end
-    if workspace:GetAttribute("FPSMode") or API.Input.GetState() ~= "Normal" then
-        return "Finish placement, aiming, or direct control."
+
+    -- Placement/input state belongs to the live client, not the fixture.
+    if tower ~= X.sim.tower then
+        if workspace:GetAttribute("FPSMode")
+            or API.Input.GetState() ~= "Normal" then
+            return "Finish placement, aiming, or direct control."
+        end
     end
+
     if not tower:Alive() then return "Tower is not alive." end
     if tower:IsRebuilding() then return "Tower is rebuilding." end
     if tower:IsReviving() then return "Tower is reviving." end
@@ -1944,7 +2464,8 @@ local function nextStep(tower, path)
 
     local cost = lh:GetLevelUpgradeCost(side, 1,
         tower.BuffHandler:GetDiscount(),
-        API.Game.GetTowerCostMultiplier(tower.Type),
+        tower == X.sim.tower
+            and 1 or API.Game.GetTowerCostMultiplier(tower.Type),
         tower:GetDynamicPriceScalingData())
 
     if type(cost) ~= "number" or cost ~= cost or cost < 0 or cost == math.huge then
@@ -1953,7 +2474,24 @@ local function nextStep(tower, path)
     return {side = side, level = before + 1, cost = cost}
 end
 
-local function finish(value, bad)
+local function finish(value, bad, state)
+    local job = S.job
+    local tower = job and job.tower
+
+    if S.uncertain then
+        X.detectRecovery(S.uncertain)
+    else
+        X.state(state or (bad and "Stopped" or "Cancelled"))
+        X.event(
+            state == "Completed" and "Build completed"
+                or state == "Selection changed" and "Selection changed"
+                or bad and "Upgrade stopped"
+                or "Upgrade cancelled",
+            value, tower
+        )
+    end
+
+    S.upgradeTelemetry.next = nil
     S.job = nil
     outstanding()
     message(value, bad)
@@ -1962,14 +2500,28 @@ end
 local function tickUncertain()
     local record = S.uncertain
     if not record then return end
-    local tower, pending = record.tower, record.pending
 
-    if API.Towers.GetTower(tower.Hash) ~= tower then
+    X.detectRecovery(record)
+    X.pumpSimulation()
+
+    local tower, pending = record.tower, record.pending
+    if not X.exists(tower) then
+        X.event("Recovery completed",
+            "Tower no longer exists. Unresolved upgrade cleared.",
+            tower, pending)
         S.uncertain = nil
+        X.recoveryRecord = nil
+        X.state("Cancelled")
         outstanding()
         message("Tower removed. Unresolved tower request cleared.")
     elseif tower.LevelHandler:GetLevelOnPath(pending.side) >= pending.level then
+        X.confirm(tower, pending, true)
+        X.event("Recovery completed",
+            "Recovery successful. Late confirmation received; restart manually.",
+            tower, pending)
         S.uncertain = nil
+        X.recoveryRecord = nil
+        X.state("Recovered")
         outstanding()
         message("Late level update received. Review before restarting.")
     end
@@ -1980,79 +2532,124 @@ local function advanceJobOnce()
     if not job then return end
     local tower = job.tower
 
-    if API.Towers.GetTower(tower.Hash) ~= tower then
-        finish("Tower removed; stopped.", true)
+    if not X.exists(tower) then
+        finish("Tower removed; stopped.", true, "Cancelled")
         return
     end
-    if API.UI.GetCurrentTower() ~= tower then
-        job.cancelReason = job.cancelReason or "Selection changed."
+
+    if X.selected() ~= tower and not job.cancelReason then
+        job.cancelReason = "Selection changed."
+        X.event("Selection changed",
+            "Selection changed; outstanding purchase must settle first.",
+            tower, job.pending)
     end
 
     local pending = job.pending
     if pending then
         if tower.LevelHandler:GetLevelOnPath(pending.side) >= pending.level then
+            X.confirm(tower, pending, false)
             job.pending = nil
             outstanding()
+            X.state("Upgrading")
         elseif os.clock() >= pending.deadline then
+            X.event("Upgrade timeout",
+                "Confirmation deadline expired; purchase will not be retried.",
+                tower, pending)
             S.uncertain = {tower = tower, pending = pending}
             S.auto = false
             table.clear(S.fresh)
+            X.event("Uncertain outcome",
+                "Auto stopped. Awaiting read-only recovery.",
+                tower, pending)
             finish("Outcome UNKNOWN. Auto stopped; no retry issued.", true)
             return
         else
+            X.state("Waiting for confirmation")
             return
         end
     end
 
     if job.cancelReason then
-        finish(job.cancelReason .. " Completed purchases remain.")
+        finish(job.cancelReason .. " Completed purchases remain.", false,
+            job.cancelReason == "Selection changed."
+                and "Selection changed" or "Cancelled")
         return
     end
 
     local why = upgradeProblem(tower)
     if why then
-        finish(why, true)
+        finish(why, true, "Stopped")
         return
     end
 
     local step, stepError, done = nextStep(tower, job.path)
     if done then
-        finish(string.format("Build complete. Reached %d-%d.", job.path.a, job.path.b))
+        S.upgradeTelemetry.current = X.levelText(tower)
+        finish(string.format("Build complete. Reached %d-%d.",
+            job.path.a, job.path.b), false, "Completed")
         return
     end
     if not step then
-        finish(stepError, true)
+        finish(stepError, true, "Stopped")
         return
     end
+
+    local telemetry = S.upgradeTelemetry
+    telemetry.current = X.levelText(tower)
+    telemetry.next = string.format("Path %d -> %d", step.side, step.level)
 
     local balance = cash()
     if balance < step.cost then
-        message(string.format("Waiting for %d more cash.", math.ceil(step.cost - balance)))
-        return
-    end
-    if API.UI.GetCurrentTower() ~= tower then
-        finish("Selection changed.")
+        local text = string.format("Waiting for %d more cash.",
+            math.ceil(step.cost - balance))
+        X.state("Waiting for cash", "Waiting for cash", text, tower)
+        message(text)
         return
     end
 
+    if X.selected() ~= tower then
+        finish("Selection changed.", false, "Selection changed")
+        return
+    end
+
+    -- Register the request before invoking either dispatch branch.
+    -- A dispatch error therefore retains the original conservative
+    -- uncertain/faulted behavior in guarded().
     job.pending = {
         side = step.side,
         level = step.level,
+        cost = step.cost,
+        simulated = job.simulated,
+        sentAt = os.clock(),
         deadline = os.clock() + ACK_TIMEOUT,
     }
     outstanding()
-    API.Upgrade:Fire(step.side, false)
-    message(string.format("Path %d -> %d. Waiting for level update.", step.side, step.level))
+
+    X.state("Waiting for confirmation")
+    X.event("Upgrade dispatched",
+        string.format("Path %d -> %d; cost %d",
+            step.side, step.level, math.ceil(step.cost)),
+        tower, job.pending)
+
+    X.sendUpgrade(job, step)
+
+    message(string.format("%sPath %d -> %d. Waiting for level update.",
+        job.simulated and "[SIM] " or "", step.side, step.level))
 end
 
 local function tickJob()
-    -- Current presets need at most seven purchases from 0-0.
-    -- Extra passes allow immediate confirmation and final completion.
-    -- The bound also protects against unexpected reentrant state changes.
-    for _ = 1, 12 do
+    local telemetry = S.upgradeTelemetry
+    telemetry.lastTickPasses = 0
+
+    -- Preserve the original 12-pass instant-chain safety bound.
+    for pass = 1, 12 do
         if not S.alive or S.faulted or S.uncertain or not S.job then
             return
         end
+
+        telemetry.lastTickPasses = pass
+        telemetry.maximumTickPasses =
+            math.max(telemetry.maximumTickPasses, pass)
 
         advanceJobOnce()
 
@@ -2061,33 +2658,34 @@ local function tickJob()
         end
 
         local job = S.job
-        if not job then
-            return
-        end
+        if not job then return end
 
         local pending = job.pending
         if not pending then
-            -- No purchase was sent, usually because cash is insufficient.
-            -- Repeating immediately cannot help.
+            -- Cash/eligibility cannot improve by spinning this frame.
             return
         end
 
-        local tower = job.tower
-        if API.Towers.GetTower(tower.Hash) ~= tower then
-            -- Let the existing removal handling clear the job.
+        if not X.exists(job.tower) then
+            -- Retain the original removal reconciliation.
             advanceJobOnce()
             return
         end
 
-        if tower.LevelHandler:GetLevelOnPath(pending.side)
+        if job.tower.LevelHandler:GetLevelOnPath(pending.side)
             < pending.level then
-            -- Still awaiting confirmation. Do not duplicate the request.
             return
         end
 
-        -- Confirmation already exists. Continue immediately.
-        -- advanceJobOnce() consumes it and rechecks selection,
-        -- cancellation, eligibility, path rules, and cash before buying.
+        if pass < 12 then
+            X.event("Instant-chain continuation",
+                "Confirmation visible; continuing without a wait.",
+                job.tower, pending)
+        else
+            X.event("Tick safety bound",
+                "12 passes reached; remaining work resumes next Heartbeat.",
+                job.tower, pending)
+        end
     end
 end
 
@@ -2103,6 +2701,15 @@ local function guarded(callback)
     end
     S.job, S.auto, S.targetAuto, S.faulted = nil, false, false, true
     table.clear(S.fresh)
+
+    if S.uncertain then
+        X.detectRecovery(S.uncertain)
+    else
+        X.state("Faulted")
+    end
+    X.event("Client contract error",
+        "Worker faulted. No further purchases are authorized.")
+
     outstanding()
     message("Client contract error. Worker stopped; see console.", true)
     warn("[TDX] " .. tostring(failure))
@@ -2110,15 +2717,25 @@ end
 
 local function start(fromAuto)
     if S.job or S.uncertain or S.closing then return end
+
     local tower = current()
     local why = upgradeProblem(tower)
     if why then
+        X.event("Start rejected", why, tower)
         message(why, true)
         return
     end
+
     S.fresh[tower] = nil
-    S.job = {tower = tower, path = PATHS[S.path]}
-    message(fromAuto and "Auto started." or "Started.")
+    S.job = {
+        tower = tower,
+        path = X.sim.enabled and X.sim.pathOverride or PATHS[S.path],
+        simulated = X.sim.enabled,
+    }
+
+    X.beginTelemetry(S.job)
+    message(X.sim.enabled and "[SIM] Started."
+        or (fromAuto and "Auto started." or "Started."))
     tickJob()
 end
 
@@ -2140,11 +2757,11 @@ local function tickAuto(dt)
 
     if scanElapsed >= 0.15 then
         scanElapsed = 0
-        for _, item in pairs(API.Towers.GetTowers()) do
+        for _, item in pairs(X.towers()) do
             observeTower(item, now)
         end
         for item in pairs(S.seen) do
-            if API.Towers.GetTower(item.Hash) ~= item then
+            if not X.exists(item) then
                 S.seen[item], S.fresh[item] = nil, nil
             end
         end
@@ -2167,6 +2784,13 @@ local function tickTargeting()
     local tower = current()
     if not tower or S.targeted[tower] or selectionProblem(tower) then return end
     S.targeted[tower] = true
+
+    if X.sim.enabled then
+        X.event("Simulation event",
+            "Virtual targeting recorded; real Target API not called.", tower)
+        return
+    end
+
     API.Target:Fire()
 end
 
@@ -2326,6 +2950,101 @@ local function renderView(v)
     set(v.footer, "Text", (dark and "TDX / CLIENT OPERATIONS  |  "
         or "IVORY STUDIO / TDX  |  ") .. state)
     set(v.footer, "TextColor3", (S.bad or S.faulted) and C.danger or C.muted)
+
+    X.renderExtension(v)
+
+    -- Keep simulation unmistakable even when diagnostics are off-screen.
+    if X.sim.enabled then
+        set(v.footer, "Text", "[SIMULATION / NO REAL PURCHASES] " .. state)
+        set(v.footer, "TextColor3", C.danger)
+        set(v.action, "Text", "[SIM] " .. (dark and string.upper(actionText) or actionText))
+    end
+end
+
+function X.renderExtension(v)
+    local t = S.upgradeTelemetry
+    local prefix = X.sim.enabled and "[SIMULATION - NO REAL PURCHASES]\n" or ""
+    local progress = t.total ~= nil
+        and string.format("%d / %d confirmed", t.completed, t.total)
+        or "No active build"
+
+    set(v.progress, "Text", prefix .. t.state .. " | " .. progress
+        .. "\nCurrent: " .. (t.current or "-")
+        .. " | Next: " .. (t.next or "-"))
+
+    local function metric(value)
+        return value and string.format("%.0f ms", value * 1000) or "-"
+    end
+
+    set(v.latency, "Text",
+        "Observed confirmation latency"
+        .. "\nLast " .. metric(t.lastLatency)
+        .. " | Avg " .. metric(t.averageLatency)
+        .. " | Recent " .. metric(t.rollingLatency))
+
+    set(v.simToggle, "Text",
+        X.sim.enabled and "SIMULATION / ON - NO REAL PURCHASES"
+            or "SIMULATION / OFF")
+    set(v.simToggle, "TextColor3", X.sim.enabled and v.C.danger or v.C.text)
+    set(v.simScenario, "Text",
+        "Scenario / " .. X.scenarios[X.sim.scenarioIndex] .. "  >")
+    set(v.qualityButton, "Text",
+        "Animation / " .. X.qualityMode .. " ("
+        .. ({"LOW", "MEDIUM", "HIGH"})[X.quality] .. ")")
+    set(v.timelineButton, "Text", X.timelineOpen and "Activity / Hide" or "Activity / Show")
+    set(v.recoveryButton, "Text",
+        S.uncertain and "Recovery / REQUIRED" or "Recovery / Clear")
+    set(v.timeline, "Visible", X.timelineOpen)
+
+    set(v.simNote, "Text", X.sim.enabled
+        and string.format("Fixture prices. Sent %d / applied %d. Tick passes %d / max %d.",
+            X.sim.dispatches, X.sim.confirmations,
+            t.lastTickPasses, t.maximumTickPasses)
+        or "Simulation uses an isolated fixture, not the selected real tower.")
+
+    if v.timelineRevision ~= t.revision then
+        v.timelineRevision = t.revision
+        local lines = {}
+        local history = t.history
+
+        -- Newest first; fixed bounded label, not one UI object per event.
+        for i = #history, 1, -1 do
+            local event = history[i]
+            lines[#lines + 1] = string.format("%.2f %s%s\n%s",
+                event.timestamp,
+                event.simulated and "[SIM] " or "",
+                event.type,
+                event.message)
+        end
+        set(v.timelineText, "Text", table.concat(lines, "\n\n"))
+        local height = math.max(180, #history * 76)
+        set(v.timelineText, "Size", UDim2.new(1, -8, 0, height))
+        set(v.timeline, "CanvasSize", UDim2.fromOffset(0, height))
+    end
+
+    local record = S.uncertain
+    set(v.recoveryPanel, "Visible",
+        record ~= nil and not X.recoveryDismissed)
+
+    if record then
+        local p = record.pending
+        local text = string.format(
+            "%sTower: %s\nExpected: Path %d -> Level %d\n"
+                .. "Last request: %.1fs ago\nStatus: Awaiting resolution\n"
+                .. "No automatic retry. Dismiss does not clear the lock.",
+            p.simulated and "[SIMULATION]\n" or "",
+            tostring(record.tower.Type), p.side, p.level,
+            math.max(0, os.clock() - p.sentAt))
+
+        if X.recoveryDetails then
+            text = text .. string.format(
+                "\nSent %.3f | deadline %.3f | cost %s\n%s",
+                p.sentAt, p.deadline, tostring(p.cost or "?"),
+                S.faulted and "Client fault remains latched."
+                    or "Re-check only reads the existing request's outcome.")
+        end
+        set(v.recoveryText, "Text", text)
+    end
 end
 
 local function render()
@@ -2358,16 +3077,19 @@ local function syncLighting()
 
     for name, v in pairs(views) do
         local active = not S.collapsed and (
-            (tr ~= nil and (
-                name == tr.outgoing or name == tr.incoming
-            ))
+            (tr ~= nil and (name == tr.outgoing or name == tr.incoming))
             or (tr == nil and name == T.current)
         )
 
         for _, tween in ipairs(v.lights) do
-            -- Avoid repeatedly calling Play on an already running tween.
-            if active then
-                if tween.PlaybackState ~= Enum.PlaybackState.Playing then
+            -- LOW keeps essential material/static atmosphere but pauses
+            -- decorative looping animation. MEDIUM retains a subset.
+            local permitted = X.quality > 1
+                and (X.qualityTweens[tween] or 1) <= X.quality
+
+            if active and permitted then
+                if tween.PlaybackState ~= Enum.PlaybackState.Playing
+                    and tween.PlaybackState ~= Enum.PlaybackState.Delayed then
                     tween:Play()
                 end
             elseif tween.PlaybackState == Enum.PlaybackState.Playing
@@ -2375,6 +3097,59 @@ local function syncLighting()
                 tween:Pause()
             end
         end
+    end
+end
+
+function X.tickQuality(dt)
+    local sample = math.clamp(dt, 1 / 240, 0.2)
+    local blend = 1 - math.exp(-math.min(dt, 0.2) / 2)
+    X.qualityEMA = X.qualityEMA + (sample - X.qualityEMA) * blend
+    X.qualityElapsed = X.qualityElapsed + dt
+
+    -- Freeze quality changes during a reveal: previously hidden branches
+    -- were intentionally absent from its cloned slices.
+    if T.transition then return end
+    if X.qualityElapsed < 2 and not X.qualityDirty then return end
+    X.qualityElapsed = 0
+
+    local wanted = X.quality
+    if X.qualityMode == "HIGH" then
+        wanted = 3
+    elseif X.qualityMode == "MEDIUM" then
+        wanted = 2
+    elseif X.qualityMode == "LOW" then
+        wanted = 1
+    elseif X.qualityDirty or os.clock() - X.qualityChangedAt >= 6 then
+        local frame = X.qualityEMA
+
+        -- Hysteresis prevents toggling around one FPS boundary.
+        if X.quality == 3 then
+            if frame > 1 / 27 then
+                wanted = 1
+            elseif frame > 1 / 45 then
+                wanted = 2
+            end
+        elseif X.quality == 2 then
+            if frame > 1 / 27 then
+                wanted = 1
+            elseif frame < 1 / 55 then
+                wanted = 3
+            end
+        elseif frame < 1 / 36 then
+            wanted = 2
+        end
+    end
+
+    if wanted ~= X.quality or X.qualityDirty then
+        X.quality = wanted
+        X.qualityDirty = false
+        X.qualityChangedAt = os.clock()
+
+        for _, entry in ipairs(X.qualityObjects) do
+            set(entry.object, "Visible",
+                entry.originalVisible and wanted >= entry.minimum)
+        end
+        syncLighting()
     end
 end
 
@@ -2631,6 +3406,18 @@ end
 
 local function beginTransition(destination)
     if destination == T.current or T.transition or not S.alive then return end
+    if S.collapsed then
+        -- No invisible slice construction for a 44px restore button.
+        T.current = destination
+        for name, v in pairs(views) do
+            v.root.Visible = name == destination
+        end
+        resetThemeDeadline()
+        updateThemeButtons()
+        syncLighting()
+        if fit then fit() end
+        return
+    end
     resetFeedback()
     dragInput = nil
 
@@ -2693,8 +3480,10 @@ local function beginTransition(destination)
     )
 
     local physicalHeight = T.height * screenScale
+    local sliceHeight = X.quality == 3 and 12
+        or X.quality == 2 and 20 or 32
     local desiredCount = math.clamp(
-        math.ceil(T.height / 12),
+        math.ceil(T.height / sliceHeight),
         8,
         72
     )
@@ -2930,10 +3719,81 @@ local function tickTheme()
     end
 end
 
+X.restoreButton = make("TextButton", shell, {
+    Name = "CompactRestore",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = palettes[T.current].surface,
+    BorderSizePixel = 0,
+    Text = "+",
+    TextColor3 = palettes[T.current].text,
+    TextSize = 28,
+    Font = Enum.Font.GothamMedium,
+    AutoButtonColor = true,
+    Visible = false,
+    Active = true,
+    ZIndex = 50,
+})
+corner(X.restoreButton, 9)
+X.restoreOutline = stroke(X.restoreButton, palettes[T.current].border, 0.2)
+
+connect(X.restoreButton.InputBegan, function(input)
+    if not S.alive or not S.collapsed or dragInput then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        X.compactMoved = false
+        dragInput, dragStart, panelStart = input, input.Position, shell.Position
+    end
+end)
+
+connect(X.restoreButton.Activated, function()
+    if S.alive and S.collapsed and not X.compactMoved then
+        dispatch("collapse")
+    end
+end)
+
 fit = function()
     if not S.alive then return end
     local size = bounds.AbsoluteSize
     if size.X <= 0 or size.Y <= 0 then return end
+
+    if S.collapsed then
+        if T.transition then settleTransition() end
+
+        if not X.compactVisibility then
+            X.compactVisibility = {}
+            for _, object in ipairs(shell:GetChildren()) do
+                if object:IsA("GuiObject") and object ~= X.restoreButton then
+                    X.compactVisibility[object] = object.Visible
+                    object.Visible = false
+                end
+            end
+        end
+
+        -- 44 screen pixels: small square, usable as a touch target.
+        local side = math.max(1, math.min(44, size.X, size.Y))
+        T.width, T.height, T.scale = side, side, 1
+        shellScale.Scale = 1
+        shell.Size = UDim2.fromOffset(side, side)
+        shell.Position = UDim2.fromOffset(
+            math.clamp(shell.Position.X.Offset, 0, math.max(0, size.X - side)),
+            math.clamp(shell.Position.Y.Offset, 0, math.max(0, size.Y - side))
+        )
+
+        X.restoreButton.BackgroundColor3 = palettes[T.current].surface
+        X.restoreButton.TextColor3 = palettes[T.current].text
+        X.restoreOutline.Color = palettes[T.current].border
+        X.restoreButton.Visible = true
+        syncLighting()
+        return
+    end
+
+    X.restoreButton.Visible = false
+    if X.compactVisibility then
+        for object, visible in pairs(X.compactVisibility) do
+            if object.Parent then object.Visible = visible end
+        end
+        X.compactVisibility = nil
+    end
 
     local availableWidth = math.max(1, size.X - 20)
     local availableHeight = math.max(1, size.Y - 20)
@@ -2941,14 +3801,12 @@ fit = function()
     scale = math.max(0.01, scale)
 
     local width = math.min(460, availableWidth / scale)
-    local totalHeight = S.collapsed and 152
-        or math.min(846, availableHeight / scale)
+    local totalHeight = math.min(846, availableHeight / scale)
     local height = math.max(1, totalHeight - 56)
 
-    local dimensionsChanged = width ~= T.width or height ~= T.height or scale ~= T.scale
+    local dimensionsChanged =
+        width ~= T.width or height ~= T.height or scale ~= T.scale
     if dimensionsChanged and T.transition then
-        -- A viewport resize commits the currently requested destination.
-        -- No stale-size masks survive into the new layout.
         settleTransition()
     end
 
@@ -2961,13 +3819,17 @@ fit = function()
             math.max(0, size.Y - totalHeight * scale - 7))
     )
 
-    for _, v in pairs(views) do
-        v.body.Visible = not S.collapsed
-        v.divider.Visible = not S.collapsed
-        v.footer.Visible = not S.collapsed
-        v.collapse.Text = S.collapsed and "+" or "-"
+    for name, v in pairs(views) do
+        if not T.transition then
+            v.root.Visible = name == T.current
+        end
+        v.body.Visible = true
+        v.divider.Visible = true
+        v.footer.Visible = true
+        v.collapse.Text = "-"
         v.reflow(width)
     end
+
     syncLighting()
 end
 
@@ -3002,6 +3864,21 @@ cleanup = function(destroyGui)
     table.clear(S.fresh)
     table.clear(S.targeted)
     S.job, S.uncertain = nil, nil
+
+    X.sim.enabled = false
+    X.sim.scheduled, X.sim.event = nil, nil
+    X.sim.tower, X.sim.selected = nil, nil
+    X.sim.pathOverride = nil
+
+    X.recoveryRecord = nil
+    X.compactVisibility = nil
+    X.restoreButton, X.restoreOutline = nil, nil
+
+    table.clear(X.qualityObjects)
+    table.clear(X.qualityTweens)
+    table.clear(S.upgradeTelemetry.history)
+    table.clear(S.upgradeTelemetry.samples)
+
     local ivory = views.IVORY
     if ivory and ivory.ivory then
         table.clear(ivory.ivory.surfaces)
@@ -3038,6 +3915,137 @@ requestClose = function(reason)
     end
 end
 
+function X.recheck()
+    if not S.uncertain then
+        message("No unresolved upgrade.")
+        return
+    end
+    if S.busy then return end
+
+    -- Deliberately does not use guarded(): faulted workers still permit
+    -- reconciliation, but never regain purchase permission.
+    X.state("Recovering")
+    X.event("Recovery re-check", "Inspecting the existing request only.",
+        S.uncertain.tower, S.uncertain.pending)
+
+    S.busy = true
+    local ok, failure = xpcall(tickUncertain, debug.traceback)
+    S.busy = false
+
+    if not ok then
+        S.faulted, S.auto, S.targetAuto = true, false, false
+        table.clear(S.fresh)
+        X.state("Uncertain")
+        message("Recovery read failed. Outcome remains unknown; no retry.", true)
+        warn("[TDX] Recovery read failed: " .. tostring(failure))
+    elseif S.uncertain then
+        X.state("Uncertain")
+        message("Expected level not observed. Still unresolved; no retry.", true)
+        X.event("Recovery unresolved",
+            "Expected level not observed. Safety lock retained.",
+            S.uncertain.tower, S.uncertain.pending)
+    end
+end
+
+function X.handleCommand(command)
+    if command == "timeline" then
+        X.timelineOpen = not X.timelineOpen
+        fit()
+        return true
+    elseif command == "quality" then
+        local modes = {"AUTO", "HIGH", "MEDIUM", "LOW"}
+        local index = table.find(modes, X.qualityMode) or 1
+        X.qualityMode = modes[index % #modes + 1]
+        X.qualityDirty = true
+        return true
+    elseif command == "recovery" then
+        X.recoveryDismissed = false
+        if not S.uncertain then message("No unresolved upgrade.") end
+        return true
+    elseif command == "details" then
+        X.recoveryDetails = not X.recoveryDetails
+        return true
+    elseif command == "dismissRecovery" then
+        X.recoveryDismissed = true
+        return true
+    elseif command == "recheck" then
+        X.recheck()
+        return true
+    end
+
+    local simulationCommand = command == "simulation"
+        or command == "scenario"
+        or command == "simReset"
+        or command == "simCash"
+    if not simulationCommand then return false end
+
+    guarded(function()
+        if S.closing then return end
+
+        if command == "simCash" then
+            if not X.sim.enabled then
+                message("Enable Simulation Mode first.", true)
+                return
+            end
+            X.sim.cash = X.sim.cash + 1000
+            X.event("Simulation event",
+                "Added 1000 virtual cash.", X.sim.tower)
+            return
+        end
+
+        outstanding()
+        if S.job or S.uncertain or S.outstanding then
+            message("Stop and resolve the current job before changing the fixture or mode.", true)
+            return
+        end
+
+        if command == "simulation" then
+            X.sim.enabled = not X.sim.enabled
+            S.auto, S.targetAuto = false, false
+            table.clear(S.seen)
+            table.clear(S.fresh)
+            table.clear(S.targeted)
+
+            if X.sim.enabled then
+                X.resetSimulation()
+                message("[SIM] Enabled. Choose a scenario, then Begin upgrade.")
+            else
+                X.event("Simulation event",
+                    "Simulation disabled. Real mode requires a new explicit start.")
+                X.sim.tower, X.sim.selected = nil, nil
+                X.sim.scheduled, X.sim.event = nil, nil
+                X.sim.pathOverride = nil
+
+                local t = S.upgradeTelemetry
+                t.startedAt = nil
+                t.completed, t.total = 0, nil
+                t.current, t.next = nil, nil
+                t.simulated = false
+                t.lastLatency, t.averageLatency = nil, nil
+                t.rollingLatency, t.maximumLatency = nil, nil
+                t.latencyCount = 0
+                table.clear(t.samples)
+                X.state("Idle")
+                message("Simulation OFF. Auto and targeting remain off.")
+            end
+        elseif command == "scenario" then
+            X.sim.scenarioIndex = X.sim.scenarioIndex % #X.scenarios + 1
+            if X.sim.enabled then X.resetSimulation() end
+        elseif command == "simReset" then
+            if X.sim.enabled then
+                X.resetSimulation()
+                message("[SIM] Fixture reset. Begin upgrade to run.")
+            else
+                message("Enable Simulation Mode first.", true)
+            end
+        end
+
+        sampleDisplay()
+    end)
+
+    return true
+end
+
 dispatch = function(command, argument)
     if not S.alive then return end
 
@@ -3047,6 +4055,11 @@ dispatch = function(command, argument)
     end
 
     if T.transition then return end
+
+    if X.handleCommand(command) then
+        render()
+        return
+    end
 
     if command == "collapse" then
         dragInput = nil
@@ -3059,6 +4072,9 @@ dispatch = function(command, argument)
     if command == "cancel" then
         if S.job then
             S.job.cancelReason = S.job.cancelReason or "Canceled."
+            X.event("Upgrade cancelled",
+                "Cancellation requested; any dispatched purchase must settle.",
+                S.job.tower, S.job.pending)
             message("Stopping after any outstanding purchase settles.")
             guarded(tickJob)
         elseif S.uncertain then
@@ -3094,7 +4110,7 @@ dispatch = function(command, argument)
             scanElapsed = 0
 
             if S.auto then
-                for _, tower in pairs(API.Towers.GetTowers()) do
+                for _, tower in pairs(X.towers()) do
                     S.seen[tower] = true
                 end
                 local tower = current()
@@ -3125,6 +4141,9 @@ connect(UIS.InputChanged, function(input)
         and input.UserInputType == Enum.UserInputType.MouseMovement
     ) then
         local delta = input.Position - dragStart
+        if S.collapsed and delta.Magnitude > 6 then
+            X.compactMoved = true
+        end
         local size = bounds.AbsoluteSize
         shell.Position = UDim2.fromOffset(
             math.clamp(
@@ -3216,6 +4235,8 @@ connect(RunService.Heartbeat, function(dt)
 
     if not S.faulted then
         guarded(function()
+            X.pumpSimulation()
+
             if S.uncertain then
                 tickUncertain()
             elseif S.job then
@@ -3264,6 +4285,7 @@ connect(RunService.Heartbeat, function(dt)
     if not S.alive then return end
 
     local ok, failure = xpcall(function()
+        X.tickQuality(dt)
         tickTheme()
         tickIvoryPresentation(dt)
 
