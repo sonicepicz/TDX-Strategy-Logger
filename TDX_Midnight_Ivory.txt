@@ -1975,7 +1975,7 @@ local function tickUncertain()
     end
 end
 
-local function tickJob()
+local function advanceJobOnce()
     local job = S.job
     if not job then return end
     local tower = job.tower
@@ -2043,6 +2043,52 @@ local function tickJob()
     outstanding()
     API.Upgrade:Fire(step.side, false)
     message(string.format("Path %d -> %d. Waiting for level update.", step.side, step.level))
+end
+
+local function tickJob()
+    -- Current presets need at most seven purchases from 0-0.
+    -- Extra passes allow immediate confirmation and final completion.
+    -- The bound also protects against unexpected reentrant state changes.
+    for _ = 1, 12 do
+        if not S.alive or S.faulted or S.uncertain or not S.job then
+            return
+        end
+
+        advanceJobOnce()
+
+        if not S.alive or S.faulted or S.uncertain then
+            return
+        end
+
+        local job = S.job
+        if not job then
+            return
+        end
+
+        local pending = job.pending
+        if not pending then
+            -- No purchase was sent, usually because cash is insufficient.
+            -- Repeating immediately cannot help.
+            return
+        end
+
+        local tower = job.tower
+        if API.Towers.GetTower(tower.Hash) ~= tower then
+            -- Let the existing removal handling clear the job.
+            advanceJobOnce()
+            return
+        end
+
+        if tower.LevelHandler:GetLevelOnPath(pending.side)
+            < pending.level then
+            -- Still awaiting confirmation. Do not duplicate the request.
+            return
+        end
+
+        -- Confirmation already exists. Continue immediately.
+        -- advanceJobOnce() consumes it and rechecks selection,
+        -- cancellation, eligibility, path rules, and cash before buying.
+    end
 end
 
 local function guarded(callback)
@@ -2872,8 +2918,15 @@ local function tickTheme()
         drawTransition(tr)
         if alpha >= 1 then settleTransition() end
     elseif THEME_SETTINGS.Enabled and T.automatic
-        and not S.closing and os.clock() >= T.deadline then
-        beginTransition(T.current == "MIDNIGHT" and "IVORY" or "MIDNIGHT")
+        and not S.closing
+        and not S.job
+        and not S.uncertain
+        and not S.outstanding
+        and os.clock() >= T.deadline then
+
+        beginTransition(
+            T.current == "MIDNIGHT" and "IVORY" or "MIDNIGHT"
+        )
     end
 end
 
