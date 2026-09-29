@@ -739,7 +739,8 @@ local function tickIvoryPresentation(dt)
         local pulse = entry.pulse and entry.pulse.Value or 1
         local qualityGain = X.quality == 3 and 1
             or X.quality == 2 and 0.78 or 0.55
-        local opacity = (1 - entry.alpha) * state.gain * weight * pulse * qualityGain
+        local opacity = (1 - entry.alpha)
+            * state.gain * weight * pulse * qualityGain
         local alpha = 1 - math.clamp(opacity, 0, 1)
 
         if math.abs(entry.object[entry.property] - alpha) > 0.0005 then
@@ -2109,6 +2110,75 @@ end
 X.buildExtensionUI(views.MIDNIGHT)
 X.buildExtensionUI(views.IVORY)
 
+function X.visualMinimum(object)
+    local minimum = 1
+    local node = object
+
+    while node and node ~= viewHost do
+        local name = node.Name
+        local point = tonumber(name:match("^AuroraPoint(%d+)$"))
+        local dust = tonumber(name:match("^IvoryDust(%d+)$"))
+        local breath = tonumber(name:match("^DustBreath(%d+)$"))
+        local ribbon = tonumber(name:match("^AuroraRibbon(%d+)$"))
+            or tonumber(name:match("^ChampagneRibbon(%d+)$"))
+
+        if point or dust or breath then
+            local index = point or dust or breath
+            minimum = math.max(minimum, index % 2 == 0 and 2 or 3)
+        elseif ribbon then
+            minimum = math.max(minimum, ribbon <= 2 and 1 or 3)
+        elseif name:find("Sparkle", 1, true) then
+            minimum = math.max(minimum, 3)
+        elseif name == "WindowPearlReflection"
+            or name == "SelectedGlassReflection"
+            or name == "PresetGlassReflection"
+            or name == "StatusGlassReflection" then
+            minimum = math.max(minimum, 3)
+        end
+
+        node = node.Parent
+    end
+
+    return minimum
+end
+
+function X.indexQuality()
+    table.clear(X.qualityObjects)
+    table.clear(X.qualityTweens)
+
+    for _, v in pairs(views) do
+        for _, object in ipairs(v.root:GetDescendants()) do
+            if object:IsA("GuiObject") then
+                local name = object.Name
+                if name:match("^AuroraPoint%d+$")
+                    or name:match("^IvoryDust%d+$")
+                    or name:match("^AuroraRibbon%d+$")
+                    or name:match("^ChampagneRibbon%d+$")
+                    or name == "WindowPearlReflection"
+                    or name == "SelectedGlassReflection"
+                    or name == "PresetGlassReflection"
+                    or name == "StatusGlassReflection"
+                    or name == "SelectedPearlSparkle"
+                    or name == "HeaderPearlSparkle" then
+                    X.qualityObjects[#X.qualityObjects + 1] = {
+                        object = object,
+                        minimum = X.visualMinimum(object),
+                        originalVisible = object.Visible,
+                    }
+                end
+            end
+        end
+    end
+
+    for source, tween in pairs(visualTweens) do
+        if typeof(source) == "Instance" then
+            X.qualityTweens[tween] = X.visualMinimum(source)
+        end
+    end
+end
+
+X.indexQuality()
+
 local function message(value, bad)
     if not S.alive then return end
     S.status, S.bad = value, bad == true
@@ -2820,6 +2890,92 @@ local function sampleDisplay()
     }
 end
 
+function X.renderExtension(v)
+    local t = S.upgradeTelemetry
+    local prefix = X.sim.enabled and "[SIMULATION - NO REAL PURCHASES]\n" or ""
+    local progress = t.total ~= nil
+        and string.format("%d / %d confirmed", t.completed, t.total)
+        or "No active build"
+
+    set(v.progress, "Text", prefix .. t.state .. " | " .. progress
+        .. "\nCurrent: " .. (t.current or "-")
+        .. " | Next: " .. (t.next or "-"))
+
+    local function metric(value)
+        return value and string.format("%.0f ms", value * 1000) or "-"
+    end
+
+    set(v.latency, "Text",
+        "Observed confirmation latency"
+        .. "\nLast " .. metric(t.lastLatency)
+        .. " | Avg " .. metric(t.averageLatency)
+        .. " | Recent " .. metric(t.rollingLatency))
+
+    set(v.simToggle, "Text",
+        X.sim.enabled and "SIMULATION / ON - NO REAL PURCHASES"
+            or "SIMULATION / OFF")
+    set(v.simToggle, "TextColor3", X.sim.enabled and v.C.danger or v.C.text)
+    set(v.simScenario, "Text",
+        "Scenario / " .. X.scenarios[X.sim.scenarioIndex] .. "  >")
+    set(v.qualityButton, "Text",
+        "Animation / " .. X.qualityMode .. " ("
+        .. ({"LOW", "MEDIUM", "HIGH"})[X.quality] .. ")")
+    set(v.timelineButton, "Text", X.timelineOpen and "Activity / Hide" or "Activity / Show")
+    set(v.recoveryButton, "Text",
+        S.uncertain and "Recovery / REQUIRED" or "Recovery / Clear")
+    set(v.timeline, "Visible", X.timelineOpen)
+
+    set(v.simNote, "Text", X.sim.enabled
+        and string.format("Fixture prices. Sent %d / applied %d. Tick passes %d / max %d.",
+            X.sim.dispatches, X.sim.confirmations,
+            t.lastTickPasses, t.maximumTickPasses)
+        or "Simulation uses an isolated fixture, not the selected real tower.")
+
+    if v.timelineRevision ~= t.revision then
+        v.timelineRevision = t.revision
+        local lines = {}
+        local history = t.history
+
+        -- Newest first; fixed bounded label, not one UI object per event.
+        for i = #history, 1, -1 do
+            local event = history[i]
+            lines[#lines + 1] = string.format("%.2f %s%s\n%s",
+                event.timestamp,
+                event.simulated and "[SIM] " or "",
+                event.type,
+                event.message)
+        end
+        set(v.timelineText, "Text", table.concat(lines, "\n\n"))
+        local height = math.max(180, #history * 76)
+        set(v.timelineText, "Size", UDim2.new(1, -8, 0, height))
+        set(v.timeline, "CanvasSize", UDim2.fromOffset(0, height))
+    end
+
+    local record = S.uncertain
+    set(v.recoveryPanel, "Visible",
+        record ~= nil and not X.recoveryDismissed)
+
+    if record then
+        local p = record.pending
+        local text = string.format(
+            "%sTower: %s\nExpected: Path %d -> Level %d\n"
+                .. "Last request: %.1fs ago\nStatus: Awaiting resolution\n"
+                .. "No automatic retry. Dismiss does not clear the lock.",
+            p.simulated and "[SIMULATION]\n" or "",
+            tostring(record.tower.Type), p.side, p.level,
+            math.max(0, os.clock() - p.sentAt))
+
+        if X.recoveryDetails then
+            text = text .. string.format(
+                "\nSent %.3f | deadline %.3f | cost %s\n%s",
+                p.sentAt, p.deadline, tostring(p.cost or "?"),
+                S.faulted and "Client fault remains latched."
+                    or "Re-check only reads the existing request's outcome.")
+        end
+        set(v.recoveryText, "Text", text)
+    end
+end
+
 local function renderView(v)
     local C, D = v.C, S.display
     local dark = v.name == "MIDNIGHT"
@@ -2958,92 +3114,6 @@ local function renderView(v)
         set(v.footer, "Text", "[SIMULATION / NO REAL PURCHASES] " .. state)
         set(v.footer, "TextColor3", C.danger)
         set(v.action, "Text", "[SIM] " .. (dark and string.upper(actionText) or actionText))
-    end
-end
-
-function X.renderExtension(v)
-    local t = S.upgradeTelemetry
-    local prefix = X.sim.enabled and "[SIMULATION - NO REAL PURCHASES]\n" or ""
-    local progress = t.total ~= nil
-        and string.format("%d / %d confirmed", t.completed, t.total)
-        or "No active build"
-
-    set(v.progress, "Text", prefix .. t.state .. " | " .. progress
-        .. "\nCurrent: " .. (t.current or "-")
-        .. " | Next: " .. (t.next or "-"))
-
-    local function metric(value)
-        return value and string.format("%.0f ms", value * 1000) or "-"
-    end
-
-    set(v.latency, "Text",
-        "Observed confirmation latency"
-        .. "\nLast " .. metric(t.lastLatency)
-        .. " | Avg " .. metric(t.averageLatency)
-        .. " | Recent " .. metric(t.rollingLatency))
-
-    set(v.simToggle, "Text",
-        X.sim.enabled and "SIMULATION / ON - NO REAL PURCHASES"
-            or "SIMULATION / OFF")
-    set(v.simToggle, "TextColor3", X.sim.enabled and v.C.danger or v.C.text)
-    set(v.simScenario, "Text",
-        "Scenario / " .. X.scenarios[X.sim.scenarioIndex] .. "  >")
-    set(v.qualityButton, "Text",
-        "Animation / " .. X.qualityMode .. " ("
-        .. ({"LOW", "MEDIUM", "HIGH"})[X.quality] .. ")")
-    set(v.timelineButton, "Text", X.timelineOpen and "Activity / Hide" or "Activity / Show")
-    set(v.recoveryButton, "Text",
-        S.uncertain and "Recovery / REQUIRED" or "Recovery / Clear")
-    set(v.timeline, "Visible", X.timelineOpen)
-
-    set(v.simNote, "Text", X.sim.enabled
-        and string.format("Fixture prices. Sent %d / applied %d. Tick passes %d / max %d.",
-            X.sim.dispatches, X.sim.confirmations,
-            t.lastTickPasses, t.maximumTickPasses)
-        or "Simulation uses an isolated fixture, not the selected real tower.")
-
-    if v.timelineRevision ~= t.revision then
-        v.timelineRevision = t.revision
-        local lines = {}
-        local history = t.history
-
-        -- Newest first; fixed bounded label, not one UI object per event.
-        for i = #history, 1, -1 do
-            local event = history[i]
-            lines[#lines + 1] = string.format("%.2f %s%s\n%s",
-                event.timestamp,
-                event.simulated and "[SIM] " or "",
-                event.type,
-                event.message)
-        end
-        set(v.timelineText, "Text", table.concat(lines, "\n\n"))
-        local height = math.max(180, #history * 76)
-        set(v.timelineText, "Size", UDim2.new(1, -8, 0, height))
-        set(v.timeline, "CanvasSize", UDim2.fromOffset(0, height))
-    end
-
-    local record = S.uncertain
-    set(v.recoveryPanel, "Visible",
-        record ~= nil and not X.recoveryDismissed)
-
-    if record then
-        local p = record.pending
-        local text = string.format(
-            "%sTower: %s\nExpected: Path %d -> Level %d\n"
-                .. "Last request: %.1fs ago\nStatus: Awaiting resolution\n"
-                .. "No automatic retry. Dismiss does not clear the lock.",
-            p.simulated and "[SIMULATION]\n" or "",
-            tostring(record.tower.Type), p.side, p.level,
-            math.max(0, os.clock() - p.sentAt))
-
-        if X.recoveryDetails then
-            text = text .. string.format(
-                "\nSent %.3f | deadline %.3f | cost %s\n%s",
-                p.sentAt, p.deadline, tostring(p.cost or "?"),
-                S.faulted and "Client fault remains latched."
-                    or "Re-check only reads the existing request's outcome.")
-        end
-        set(v.recoveryText, "Text", text)
     end
 end
 
@@ -3864,7 +3934,6 @@ cleanup = function(destroyGui)
     table.clear(S.fresh)
     table.clear(S.targeted)
     S.job, S.uncertain = nil, nil
-
     X.sim.enabled = false
     X.sim.scheduled, X.sim.event = nil, nil
     X.sim.tower, X.sim.selected = nil, nil
