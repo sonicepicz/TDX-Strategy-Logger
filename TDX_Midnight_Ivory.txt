@@ -190,6 +190,38 @@ local X = {
     },
 }
 
+X.boot = {
+    active = true,
+    running = false,
+    completed = false,
+    failed = false,
+    startedAt = 0,
+    duration = 5.30,
+    skipAt = nil,
+    skipDuration = 0.24,
+    fade = 0,
+    revealing = false,
+    overlay = nil,
+    connections = {},
+    objects = {
+        ribbons = {},
+        motes = {},
+        blooms = {},
+    },
+    checkpoints = {
+        contracts = true,
+    },
+}
+
+function X.bootCheckpoint(name)
+    X.boot.checkpoints[name] = true
+end
+
+function X.bootEase(value)
+    local p = math.clamp(value, 0, 1)
+    return p * p * (3 - 2 * p)
+end
+
 S.upgradeTelemetry = {
     startedAt = nil,
     completed = 0,
@@ -940,6 +972,7 @@ local shell = make("Frame", bounds, {
     Position = UDim2.fromOffset(20, 30),
     Size = UDim2.fromOffset(460, 790),
     BackgroundTransparency = 1,
+    Visible = false,
 })
 
 local shellScale = make("UIScale", shell, {Scale = 1})
@@ -2109,6 +2142,7 @@ end
 
 X.buildExtensionUI(views.MIDNIGHT)
 X.buildExtensionUI(views.IVORY)
+X.bootCheckpoint("interface")
 
 function X.visualMinimum(object)
     local minimum = 1
@@ -2178,6 +2212,7 @@ function X.indexQuality()
 end
 
 X.indexQuality()
+X.bootCheckpoint("presentation")
 
 local function message(value, bad)
     if not S.alive then return end
@@ -3475,6 +3510,10 @@ local function drawTransition(tr)
 end
 
 local function beginTransition(destination)
+    if X.boot.active then
+        return
+    end
+
     if destination == T.current or T.transition or not S.alive then return end
     if S.collapsed then
         -- No invisible slice construction for a 44px restore button.
@@ -3735,6 +3774,10 @@ local function visualFailure(failure)
 end
 
 requestTheme = function(mode)
+    if X.boot.active then
+        return
+    end
+
     if not S.alive or not THEME_SETTINGS.Enabled then return end
     if mode ~= "MIDNIGHT" and mode ~= "IVORY" and mode ~= "AUTO" then return end
 
@@ -3769,6 +3812,10 @@ requestTheme = function(mode)
 end
 
 local function tickTheme()
+    if X.boot.active then
+        return
+    end
+
     local tr = T.transition
     if tr then
         local alpha = math.clamp((os.clock() - tr.started) / tr.duration, 0, 1)
@@ -3903,8 +3950,655 @@ fit = function()
     syncLighting()
 end
 
+-- Declared here so the boot functions below and renderSafely() share one
+-- upvalue instead of the boot code reading an undeclared global.
+local presentationFailed = false
+
+function X.bootConnect(signal, callback)
+    local connection = signal:Connect(callback)
+    X.boot.connections[#X.boot.connections + 1] = connection
+    return connection
+end
+
+function X.bootDestroy()
+    local b = X.boot
+    b.active = false
+    b.running = false
+    b.skipAt = nil
+    b.revealing = false
+
+    for _, connection in ipairs(b.connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(b.connections)
+
+    local overlay = b.overlay
+    b.overlay = nil
+    if overlay then
+        pcall(function()
+            overlay:Destroy()
+        end)
+    end
+
+    table.clear(b.objects.ribbons)
+    table.clear(b.objects.motes)
+    table.clear(b.objects.blooms)
+    table.clear(b.checkpoints)
+
+    b.fade = 0
+    b.startedAt = 0
+end
+
+function X.bootFinish(failed)
+    local b = X.boot
+
+    if not b.active and not b.running and not b.overlay then
+        if S.alive then
+            shell.Visible = true
+            pcall(fit)
+        end
+        return
+    end
+
+    b.failed = b.failed or failed == true
+    b.completed = not b.failed
+
+    X.bootDestroy()
+
+    if not S.alive then
+        return
+    end
+
+    shell.Visible = true
+    pcall(fit)
+    pcall(resetThemeDeadline)
+    pcall(updateThemeButtons)
+    pcall(syncLighting)
+end
+
+function X.bootFail(failure)
+    X.boot.failed = true
+    warn("[TDX] Cinematic boot stopped; restoring panel: " .. tostring(failure))
+    X.bootFinish(true)
+end
+
+function X.bootSkip()
+    local b = X.boot
+    if not S.alive or not b.active or not b.running or b.skipAt then
+        return
+    end
+    b.skipAt = os.clock()
+end
+
+function X.bootMake(className, parent, properties)
+    local object = Instance.new(className)
+    for key, value in pairs(properties or {}) do
+        object[key] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+function X.bootBuild()
+    local b = X.boot
+    if b.overlay then
+        return
+    end
+
+    local overlay = Instance.new("ScreenGui")
+    b.overlay = overlay
+    overlay.Name = "TDXCinematicBoot"
+    overlay.ResetOnSpawn = false
+    overlay.IgnoreGuiInset = true
+    overlay.DisplayOrder = gui.DisplayOrder + 10
+    overlay.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    overlay.Enabled = false
+
+    local o = b.objects
+    table.clear(o.ribbons)
+    table.clear(o.motes)
+    table.clear(o.blooms)
+
+    o.base = X.bootMake("Frame", overlay, {
+        Name = "BlackFoundation",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Active = true,
+        ZIndex = 1,
+    })
+
+    o.night = X.bootMake("Frame", o.base, {
+        Name = "MidnightFoundation",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = palettes.MIDNIGHT.bg,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 1,
+    })
+
+    local ribbonSpecs = {
+        {x = 0.10, drift = 0.17, alpha = 0.58, period = 13, phase = 0.0, rotation = -18, color = Color3.fromRGB(35, 110, 255)},
+        {x = 0.34, drift = -0.14, alpha = 0.63, period = 17, phase = 0.8, rotation = 15, color = Color3.fromRGB(125, 65, 255)},
+        {x = 0.65, drift = 0.16, alpha = 0.64, period = 20, phase = 1.5, rotation = -12, color = Color3.fromRGB(30, 170, 255)},
+        {x = 0.90, drift = -0.18, alpha = 0.61, period = 15, phase = 0.4, rotation = 22, color = Color3.fromRGB(155, 85, 255)},
+    }
+
+    for index, spec in ipairs(ribbonSpecs) do
+        local ribbon = X.bootMake("Frame", o.base, {
+            Name = "AuroraRibbon" .. index,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(spec.x, 0.5),
+            Size = UDim2.fromScale(0.78, 1.8),
+            BackgroundColor3 = spec.color,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = false,
+            ZIndex = 2,
+        })
+
+        X.bootMake("UIGradient", ribbon, {
+            Rotation = spec.rotation,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1),
+                NumberSequenceKeypoint.new(0.14, 0.94),
+                NumberSequenceKeypoint.new(0.30, 0.58),
+                NumberSequenceKeypoint.new(0.44, 0.12),
+                NumberSequenceKeypoint.new(0.52, 0),
+                NumberSequenceKeypoint.new(0.63, 0.30),
+                NumberSequenceKeypoint.new(0.82, 0.88),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        })
+
+        o.ribbons[#o.ribbons + 1] = {
+            object = ribbon,
+            x = spec.x,
+            drift = spec.drift,
+            alpha = spec.alpha,
+            period = spec.period,
+            phase = spec.phase,
+        }
+    end
+
+    local moteSpecs = {
+        {0.05, 0.18, 4, 0.0}, {0.95, 0.25, 3, 0.6},
+        {0.07, 0.44, 3, 1.1}, {0.93, 0.58, 4, 1.7},
+        {0.06, 0.83, 3, 2.1}, {0.20, 0.12, 4, 2.7},
+        {0.43, 0.31, 3, 0.9}, {0.72, 0.43, 4, 1.4},
+        {0.30, 0.68, 3, 2.5}, {0.64, 0.86, 4, 3.0},
+        {0.84, 0.73, 3, 1.9}, {0.15, 0.55, 3, 0.4},
+    }
+
+    for index, spec in ipairs(moteSpecs) do
+        local point = X.bootMake("Frame", o.base, {
+            Name = "AuroraPoint" .. index,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(spec[1], spec[2]),
+            Size = UDim2.fromOffset(spec[3], spec[3]),
+            BackgroundColor3 = index % 2 == 0
+                and Color3.fromRGB(225, 242, 255)
+                or Color3.fromRGB(110, 190, 255),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = false,
+            ZIndex = 3,
+        })
+        X.bootMake("UICorner", point, {
+            CornerRadius = UDim.new(1, 0),
+        })
+        o.motes[#o.motes + 1] = {
+            object = point,
+            x = spec[1],
+            y = spec[2],
+            phase = spec[4],
+        }
+    end
+
+    o.center = X.bootMake("Frame", o.base, {
+        Name = "CinematicCenter",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.46),
+        Size = UDim2.fromOffset(520, 280),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    })
+
+    o.centerScale = X.bootMake("UIScale", o.center, {Scale = 1})
+
+    for index = 1, 7 do
+        local size = 8 + index * 8
+        local bloom = X.bootMake("Frame", o.center, {
+            Name = "CentralBloom" .. index,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0.5, 0, 0, 106),
+            Size = UDim2.fromOffset(size, size),
+            BackgroundColor3 = palettes.MIDNIGHT.accent,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ZIndex = 1,
+        })
+        X.bootMake("UICorner", bloom, {
+            CornerRadius = UDim.new(1, 0),
+        })
+        o.blooms[#o.blooms + 1] = {
+            object = bloom,
+            strength = 0.92 - index * 0.08,
+        }
+    end
+
+    o.point = X.bootMake("Frame", o.center, {
+        Name = "CentralPoint",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, 0, 0, 106),
+        Size = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = Color3.fromRGB(245, 249, 255),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    })
+    X.bootMake("UICorner", o.point, {
+        CornerRadius = UDim.new(1, 0),
+    })
+
+    o.flare = X.bootMake("Frame", o.center, {
+        Name = "PearlHorizonLight",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, 0, 0, 106),
+        Size = UDim2.fromOffset(240, 1),
+        BackgroundColor3 = Color3.fromRGB(225, 242, 255),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    })
+    X.bootMake("UIGradient", o.flare, {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.40, 0.76),
+            NumberSequenceKeypoint.new(0.50, 0),
+            NumberSequenceKeypoint.new(0.60, 0.76),
+            NumberSequenceKeypoint.new(1, 1),
+        }),
+    })
+
+    local function bootText(name, value, y, height, size, font)
+        return X.bootMake("TextLabel", o.center, {
+            Name = name,
+            Position = UDim2.fromOffset(0, y),
+            Size = UDim2.new(1, 0, 0, height),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = value,
+            TextColor3 = Color3.fromRGB(245, 243, 238),
+            TextSize = size,
+            Font = font,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextYAlignment = Enum.TextYAlignment.Center,
+            TextWrapped = false,
+            TextTransparency = 1,
+            ZIndex = 4,
+        })
+    end
+
+    o.title = bootText("TDXTitle", "TDX", 38, 96, 90, Enum.Font.GothamBlack)
+    X.bootMake("UIGradient", o.title, {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(169, 203, 255)),
+            ColorSequenceKeypoint.new(0.45, Color3.fromRGB(249, 251, 255)),
+            ColorSequenceKeypoint.new(0.70, Color3.fromRGB(255, 253, 248)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(228, 192, 120)),
+        }),
+    })
+
+    o.subtitle = bootText("Edition", "M I D N I G H T  +  I V O R Y", 145, 24, 15, Enum.Font.GothamMedium)
+    o.status = bootText("Checkpoint", "", 196, 24, 12, Enum.Font.Gotham)
+
+    o.track = X.bootMake("Frame", o.center, {
+        Name = "ProgressRule",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, 0, 0, 244),
+        Size = UDim2.fromOffset(290, 1),
+        BackgroundColor3 = Color3.fromRGB(225, 232, 244),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    })
+
+    o.progress = X.bootMake("Frame", o.track, {
+        Name = "CompletedRule",
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = Color3.fromRGB(255, 247, 224),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    })
+
+    o.diamond = X.bootMake("Frame", o.track, {
+        Name = "ProgressDiamond",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        Size = UDim2.fromOffset(6, 6),
+        Rotation = 45,
+        BackgroundColor3 = Color3.fromRGB(255, 247, 224),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    })
+
+    o.sweep = X.bootMake("Frame", o.base, {
+        Name = "ChampagneSweep",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    })
+
+    o.sweepGradient = X.bootMake("UIGradient", o.sweep, {
+        Rotation = 24,
+        Offset = Vector2.new(-1.5, 0),
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(178, 132, 58)),
+            ColorSequenceKeypoint.new(0.35, Color3.fromRGB(224, 190, 119)),
+            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 253, 245)),
+            ColorSequenceKeypoint.new(0.65, Color3.fromRGB(231, 201, 143)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 250, 236)),
+        }),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0.00, 1.00),
+            NumberSequenceKeypoint.new(0.30, 1.00),
+            NumberSequenceKeypoint.new(0.42, 0.94),
+            NumberSequenceKeypoint.new(0.48, 0.58),
+            NumberSequenceKeypoint.new(0.50, 0.08),
+            NumberSequenceKeypoint.new(0.52, 0.58),
+            NumberSequenceKeypoint.new(0.58, 0.94),
+            NumberSequenceKeypoint.new(0.70, 1.00),
+            NumberSequenceKeypoint.new(1.00, 1.00),
+        }),
+    })
+
+    X.bootMake("TextButton", o.base, {
+        Name = "BootInputShield",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        Active = true,
+        Selectable = false,
+        ZIndex = 10,
+    })
+
+    o.skip = X.bootMake("TextButton", o.base, {
+        Name = "SkipBoot",
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -24, 1, -28),
+        Size = UDim2.fromOffset(96, 48),
+        BackgroundColor3 = palettes.MIDNIGHT.surface2,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = "Skip  >",
+        TextColor3 = Color3.fromRGB(245, 243, 238),
+        TextSize = 14,
+        Font = Enum.Font.GothamMedium,
+        TextTransparency = 1,
+        AutoButtonColor = false,
+        Active = true,
+        Selectable = true,
+        Visible = false,
+        ZIndex = 11,
+    })
+    X.bootMake("UICorner", o.skip, {
+        CornerRadius = UDim.new(0, 12),
+    })
+    X.bootMake("UIStroke", o.skip, {
+        Color = palettes.MIDNIGHT.secondary,
+        Thickness = 1,
+        Transparency = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+
+    X.bootConnect(o.skip.Activated, X.bootSkip)
+
+    overlay.Parent = playerGui
+end
+
+function X.bootStatus(elapsed)
+    local c = X.boot.checkpoints
+    local ready =
+        c.contracts
+        and c.interface
+        and c.presentation
+        and c.worker
+        and c.display
+        and c.rendered
+        and not S.faulted
+
+    if elapsed >= 4.00 then
+        return ready and "READY" or "Finalizing interface", ready and 1 or 0.90
+    elseif elapsed >= 3.20 then
+        return c.worker and "Loading tower controller..."
+            or "Preparing tower controller...",
+            c.worker and 0.78 or 0.66
+    elseif elapsed >= 2.50 then
+        return c.interface and "Initializing interface..."
+            or "Preparing interface...",
+            c.presentation and 0.58 or 0.42
+    end
+
+    return "", 0
+end
+
+function X.bootTick()
+    local b = X.boot
+    if not b.active or not b.running then
+        return
+    end
+
+    if not S.alive then
+        X.bootDestroy()
+        return
+    end
+
+    if S.closing or not gui.Enabled then
+        X.bootFinish(false)
+        return
+    end
+
+    if not b.overlay or not b.overlay:IsDescendantOf(playerGui) then
+        error("Boot overlay was removed.")
+    end
+    if not shell.Parent then
+        error("Existing shell was removed.")
+    end
+
+    local now = os.clock()
+    local elapsed = math.max(0, now - b.startedAt)
+    local fade = X.bootEase((elapsed - 5.00) / 0.30)
+
+    if b.skipAt then
+        local skipProgress = math.clamp((now - b.skipAt) / b.skipDuration, 0, 1)
+        fade = math.max(fade, X.bootEase(skipProgress))
+    end
+
+    b.fade = fade
+
+    if (elapsed >= 5.00 or b.skipAt ~= nil) and not b.revealing then
+        b.revealing = true
+        shell.Visible = true
+    end
+
+    local o = b.objects
+    local viewport = o.base.AbsoluteSize
+    if viewport.X <= 0 or viewport.Y <= 0 then
+        viewport = bounds.AbsoluteSize
+    end
+
+    o.centerScale.Scale = math.clamp(
+        math.min((viewport.X - 32) / 520, (viewport.Y - 120) / 280),
+        0.50,
+        1
+    )
+
+    local visibleEnvelope = 1 - fade
+    o.base.BackgroundTransparency = fade
+
+    local nightGain = X.bootEase((elapsed - 0.85) / 0.55)
+    local lightGain = X.bootEase((elapsed - 0.50) / 0.45)
+    local titleGain = X.bootEase((elapsed - 1.50) / 0.45)
+    local subtitleGain = X.bootEase((elapsed - 2.00) / 0.35)
+    local statusGain = X.bootEase((elapsed - 2.50) / 0.20)
+
+    o.night.BackgroundTransparency =
+        1 - nightGain * visibleEnvelope
+
+    for _, entry in ipairs(o.ribbons) do
+        local wave = math.sin(elapsed / entry.period + entry.phase)
+        entry.object.Position = UDim2.fromScale(
+            entry.x + entry.drift * 0.50 * wave,
+            0.5
+        )
+        entry.object.BackgroundTransparency =
+            1 - (1 - entry.alpha)
+                * nightGain
+                * visibleEnvelope
+                * (0.78 + 0.22 * (0.5 + 0.5 * wave))
+    end
+
+    for _, entry in ipairs(o.motes) do
+        local driftX = math.sin(elapsed * 0.45 + entry.phase) * 0.010
+        local driftY = math.cos(elapsed * 0.35 + entry.phase) * 0.010
+        local breathe =
+            0.65 + 0.35 * (
+                0.5 + 0.5 * math.sin(elapsed * 1.25 + entry.phase)
+            )
+
+        entry.object.Position = UDim2.fromScale(
+            entry.x + driftX,
+            entry.y + driftY
+        )
+        entry.object.BackgroundTransparency =
+            1 - 0.90 * nightGain * visibleEnvelope * breathe
+    end
+
+    for _, entry in ipairs(o.blooms) do
+        entry.object.BackgroundTransparency =
+            1 - lightGain
+                * entry.strength
+                * (1 - 0.72 * titleGain)
+                * visibleEnvelope
+    end
+
+    o.point.BackgroundTransparency =
+        1 - lightGain * (1 - titleGain) * visibleEnvelope
+
+    o.flare.BackgroundTransparency =
+        1 - 0.86 * lightGain * visibleEnvelope
+
+    o.title.TextTransparency =
+        1 - titleGain * visibleEnvelope
+    o.title.Position = UDim2.fromOffset(
+        0,
+        38 + 8 * (1 - titleGain)
+    )
+
+    o.subtitle.TextTransparency =
+        1 - subtitleGain * visibleEnvelope
+    o.status.TextTransparency =
+        1 - statusGain * visibleEnvelope
+
+    local status, progress = X.bootStatus(elapsed)
+    o.status.Text = status
+
+    o.track.BackgroundTransparency =
+        1 - 0.72 * statusGain * visibleEnvelope
+    o.progress.Size = UDim2.fromScale(progress, 1)
+    o.progress.BackgroundTransparency =
+        1 - 0.95 * statusGain * visibleEnvelope
+    o.diamond.Position = UDim2.fromScale(progress, 0.5)
+    o.diamond.BackgroundTransparency =
+        1 - 0.98 * statusGain * visibleEnvelope
+
+    local sweepProgress = X.bootEase((elapsed - 4.40) / 0.60)
+    local sweepEnvelope =
+        X.bootEase((elapsed - 4.40) / 0.10)
+        * (1 - X.bootEase((elapsed - 4.90) / 0.10))
+
+    o.sweepGradient.Offset = Vector2.new(
+        -1.5 + 3 * sweepProgress,
+        0
+    )
+    o.sweep.BackgroundTransparency =
+        1 - 0.92 * sweepEnvelope
+
+    local skipGain = X.bootEase((elapsed - 0.50) / 0.25)
+    o.skip.Visible = elapsed >= 0.50 and fade < 1
+    o.skip.BackgroundTransparency =
+        1 - 0.30 * skipGain * visibleEnvelope
+    o.skip.TextTransparency =
+        1 - 0.92 * skipGain * visibleEnvelope
+    o.skip.Text = b.skipAt and "Opening" or "Skip  >"
+
+    if fade >= 1 or elapsed >= b.duration then
+        X.bootFinish(false)
+    end
+end
+
+function X.bootTickSafely()
+    if not X.boot.active or not X.boot.running then
+        return
+    end
+
+    local ok, failure = xpcall(X.bootTick, debug.traceback)
+    if not ok then
+        X.bootFail(failure)
+    end
+end
+
+function X.bootStart()
+    local b = X.boot
+
+    if not S.alive or not b.active or b.running then
+        return
+    end
+
+    if S.faulted or presentationFailed then
+        X.bootFinish(true)
+        return
+    end
+
+    local ok, failure = xpcall(function()
+        assert(not T.transition, "Theme transition active before cinematic boot.")
+        resetFeedback()
+        dragInput = nil
+        shell.Visible = false
+
+        X.bootBuild()
+
+        b.startedAt = os.clock()
+        b.running = true
+        b.fade = 0
+
+        X.bootTick()
+
+        if b.overlay then
+            b.overlay.Enabled = true
+        end
+    end, debug.traceback)
+
+    if not ok then
+        X.bootFail(failure)
+    end
+end
+
 cleanup = function(destroyGui)
     if not S.alive then return end
+    X.bootDestroy()
     S.alive, S.auto, S.targetAuto = false, false, false
     T.automatic = false
     dragInput = nil
@@ -4123,6 +4817,10 @@ dispatch = function(command, argument)
         return
     end
 
+    if X.boot.active then
+        return
+    end
+
     if T.transition then return end
 
     if X.handleCommand(command) then
@@ -4275,7 +4973,7 @@ end)
 
 local uiElapsed = 0.15
 local uncertainReadFailed = false
-local presentationFailed = false
+presentationFailed = false
 
 local function renderSafely()
     if not S.alive or presentationFailed then return end
@@ -4300,6 +4998,9 @@ end
 -- One heartbeat owns gameplay progression, display sampling, and the reveal.
 -- Theme animation never starts another gameplay worker.
 connect(RunService.Heartbeat, function(dt)
+    if not S.alive then return end
+
+    X.bootTickSafely()
     if not S.alive then return end
 
     if not S.faulted then
@@ -4385,13 +5086,30 @@ end)
 -- or view construction is needed here.
 destroyTransition()
 fit()
-resetThemeDeadline()
 updateThemeButtons()
+
 guarded(sampleDisplay)
+
+if S.alive and not S.faulted then
+    X.bootCheckpoint("display")
+end
+
 renderSafely()
 
+if S.alive and not presentationFailed then
+    X.bootCheckpoint("rendered")
+end
+
 if S.alive then
+    X.bootCheckpoint("worker")
     syncLighting()
+
+    if not S.faulted and not presentationFailed then
+        X.bootStart()
+    else
+        X.bootFinish(true)
+    end
+
     if not S.faulted then
         print("[TDX] Midnight + Ivory loaded. One shared gameplay worker; "
             .. "server/client purchase limits still apply.")
