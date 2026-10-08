@@ -196,9 +196,12 @@ X.boot = {
     completed = false,
     failed = false,
     startedAt = 0,
+    -- Storyboard seconds. Every cue in the boot (0.40 seed ... 5.30 handoff)
+    -- is written in storyboard time; real time = storyboard time * pace.
     duration = 5.30,
+    pace = 1.50,
     skipAt = nil,
-    skipDuration = 0.24,
+    skipDuration = 0.40,
     fade = 0,
     revealing = false,
     overlay = nil,
@@ -4881,7 +4884,8 @@ function X.bootTick()
     --     always completes and bootFinish is always reached.
     local now = os.clock()
     local presentationNow = b.skipAt or now
-    local elapsed = math.max(0, presentationNow - b.startedAt)
+    -- Presentation time in storyboard seconds (real seconds / pace).
+    local elapsed = math.max(0, presentationNow - b.startedAt) / b.pace
     local fade = X.bootEase((elapsed - 5.00) / 0.30)
 
     if b.skipAt then
