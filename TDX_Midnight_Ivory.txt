@@ -3982,9 +3982,13 @@ function X.bootDestroy()
         end)
     end
 
-    table.clear(b.objects.ribbons)
-    table.clear(b.objects.motes)
-    table.clear(b.objects.blooms)
+    -- The overlay has already been destroyed above. Release every retained
+    -- GUI reference (scalar objects and the V2 record) while keeping the
+    -- table shape X.bootBuild requires for a later boot run.
+    table.clear(b.objects)
+    b.objects.ribbons = {}
+    b.objects.motes = {}
+    b.objects.blooms = {}
     table.clear(b.checkpoints)
 
     b.fade = 0
@@ -4041,6 +4045,188 @@ function X.bootMake(className, parent, properties)
     return object
 end
 
+-- Cinematic boot V2: presentation-only layers.
+-- Built once inside the existing protected X.bootStart path and parented under
+-- the boot overlay, so the existing boot cleanup owns every instance.
+-- Static source reasoning only; not runtime-tested inside Roblox/TDX.
+
+function X.bootV2Build()
+    local b = X.boot
+    local o = b.objects
+    if o.v2 then return end
+
+    local v = {
+        progress = 0,
+        progressFrom = 0,
+        progressTarget = 0,
+        progressAt = 0,
+        halos = {},
+        shafts = {},
+    }
+    o.v2 = v
+
+    local cool = Color3.fromRGB(131, 183, 255)
+    local pearl = Color3.fromRGB(255, 247, 226)
+
+    local function field(parent, name, color, z)
+        return X.bootMake("Frame", parent, {
+            Name = name,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromScale(1, 1),
+            BackgroundColor3 = color,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = false,
+            Interactable = false,
+            Selectable = false,
+            ZIndex = z,
+        })
+    end
+
+    local function feather(object, rotation)
+        return X.bootMake("UIGradient", object, {
+            Rotation = rotation,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1),
+                NumberSequenceKeypoint.new(0.20, 0.94),
+                NumberSequenceKeypoint.new(0.40, 0.55),
+                NumberSequenceKeypoint.new(0.50, 0),
+                NumberSequenceKeypoint.new(0.60, 0.55),
+                NumberSequenceKeypoint.new(0.80, 0.94),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        })
+    end
+
+    -- Narrow, distant illumination; not another full-screen color wash.
+    for index = 1, 3 do
+        local shaft = field(o.base, "BootV2Shaft" .. index, cool, 2)
+        shaft.Size = UDim2.fromScale(0.12, 1.6)
+        feather(shaft, 0)
+        v.shafts[index] = shaft
+    end
+
+    -- Dark edges keep the identity dominant as the atmosphere develops.
+    v.edges = field(o.base, "BootV2EdgeFalloff", Color3.new(0, 0, 0), 4)
+    X.bootMake("UIGradient", v.edges, {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(0.18, 0.75),
+            NumberSequenceKeypoint.new(0.40, 1),
+            NumberSequenceKeypoint.new(0.60, 1),
+            NumberSequenceKeypoint.new(0.82, 0.75),
+            NumberSequenceKeypoint.new(1, 0),
+        }),
+    })
+
+    -- Local halo companions reuse the existing deterministic mote field.
+    for index, entry in ipairs(o.motes) do
+        local halo = field(entry.object, "BootV2MoteHalo", cool, 1)
+        halo.Size = UDim2.fromOffset(12, 12)
+        X.bootMake("UICorner", halo, {
+            CornerRadius = UDim.new(1, 0),
+        })
+        v.halos[index] = halo
+    end
+
+    v.vertical = field(o.center, "BootV2SeedVertical", cool, 2)
+    v.vertical.Position = UDim2.new(0.5, 0, 0, 106)
+    v.vertical.Size = UDim2.fromOffset(1, 74)
+    feather(v.vertical, 90)
+
+    -- A serif identity; the real Midnight / Ivory views are untouched.
+    o.title.Font = Enum.Font.Bodoni
+    o.title.TextSize = 98
+
+    v.titleGlow = X.bootMake("TextLabel", o.center, {
+        Name = "BootV2TitleLight",
+        Position = o.title.Position,
+        Size = o.title.Size,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = "TDX",
+        Font = o.title.Font,
+        TextSize = 100,
+        TextColor3 = cool,
+        TextTransparency = 1,
+        TextStrokeColor3 = cool,
+        TextStrokeTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Active = false,
+        Interactable = false,
+        ZIndex = 3,
+    })
+
+    -- This foreground duplicate illuminates the existing lettering.
+    v.titleLight = X.bootMake("TextLabel", o.center, {
+        Name = "BootV2TitleReflection",
+        Position = o.title.Position,
+        Size = o.title.Size,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = "TDX",
+        Font = o.title.Font,
+        TextSize = 98,
+        TextColor3 = pearl,
+        TextTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Active = false,
+        Interactable = false,
+        ZIndex = 5,
+    })
+
+    v.awakening = X.bootMake("TextLabel", o.center, {
+        Name = "BootV2Awakening",
+        Position = UDim2.fromOffset(0, 24),
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        Text = "M I D N I G H T   A W A K E N S",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextColor3 = cool,
+        TextTransparency = 1,
+        Active = false,
+        Interactable = false,
+        ZIndex = 4,
+    })
+
+    feather(o.track, 0)
+    feather(o.progress, 0)
+
+    v.trail = field(o.track, "BootV2ProgressTrail", cool, 5)
+    v.trail.AnchorPoint = Vector2.new(1, 0.5)
+    v.trail.Size = UDim2.fromOffset(58, 2)
+    X.bootMake("UIGradient", v.trail, {
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.75, 0.60),
+            NumberSequenceKeypoint.new(1, 0),
+        }),
+    })
+
+    v.markerLight = field(o.track, "BootV2MarkerLight", pearl, 5)
+    v.markerLight.Size = UDim2.fromOffset(38, 10)
+    feather(v.markerLight, 0)
+
+    -- Broad outer field plus the existing narrow luminous core.
+    -- Only gradients rotate; GUI rectangles remain unrotated.
+    v.sweepOuter = field(o.base, "BootV2SweepAtmosphere", pearl, 4)
+    v.sweepOuterGradient = feather(v.sweepOuter, -24)
+    v.sweepOuterGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(94, 128, 233)),
+        ColorSequenceKeypoint.new(0.35, Color3.fromRGB(180, 179, 231)),
+        ColorSequenceKeypoint.new(0.50, pearl),
+        ColorSequenceKeypoint.new(0.65, Color3.fromRGB(229, 193, 137)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(112, 129, 220)),
+    })
+    o.sweepGradient.Rotation = -24
+
+    v.skipStroke = o.skip:FindFirstChildOfClass("UIStroke")
+end
+
 function X.bootBuild()
     local b = X.boot
     if b.overlay then
@@ -4057,6 +4243,7 @@ function X.bootBuild()
     overlay.Enabled = false
 
     local o = b.objects
+    o.v2 = nil
     table.clear(o.ribbons)
     table.clear(o.motes)
     table.clear(o.blooms)
@@ -4365,33 +4552,302 @@ function X.bootBuild()
 
     X.bootConnect(o.skip.Activated, X.bootSkip)
 
+    X.bootV2Build()
+
     overlay.Parent = playerGui
 end
 
 function X.bootStatus(elapsed)
     local c = X.boot.checkpoints
-    local ready =
-        c.contracts
-        and c.interface
-        and c.presentation
-        and c.worker
-        and c.display
-        and c.rendered
-        and not S.faulted
 
-    if elapsed >= 4.00 then
-        return ready and "READY" or "Finalizing interface", ready and 1 or 0.90
-    elseif elapsed >= 3.20 then
-        return c.worker and "Loading tower controller..."
-            or "Preparing tower controller...",
-            c.worker and 0.78 or 0.66
-    elseif elapsed >= 2.50 then
-        return c.interface and "Initializing interface..."
-            or "Preparing interface...",
-            c.presentation and 0.58 or 0.42
+    -- Count only the completed contiguous initialization prefix.
+    -- Presentation timing may under-report completion, never invent it.
+    local completed = 0
+    if c.contracts then
+        completed = 1
+        if c.interface then
+            completed = 2
+            if c.presentation then
+                completed = 3
+                if c.display then
+                    completed = 4
+                    if c.rendered then
+                        completed = 5
+                        if c.worker then
+                            completed = 6
+                        end
+                    end
+                end
+            end
+        end
     end
 
-    return "", 0
+    local ready = completed == 6
+        and not S.faulted
+        and not presentationFailed
+
+    if elapsed < 2.50 then
+        return "", 0
+    end
+
+    local cap = elapsed < 3.20 and 3
+        or elapsed < 4.00 and 5
+        or 6
+    local progress = math.min(completed, cap) / 6
+
+    if elapsed >= 4.00 and ready then
+        return "READY", 1
+    end
+
+    if S.faulted or presentationFailed then
+        return "Initialization interrupted", math.min(progress, 5 / 6)
+    end
+
+    if completed < 1 then
+        return "Waiting for client contracts...", progress
+    elseif completed < 2 then
+        return "Preparing interface...", progress
+    elseif completed < 3 then
+        return "Preparing presentation...", progress
+    elseif completed < 4 then
+        return "Preparing display...", progress
+    elseif completed < 5 then
+        return "Preparing first render...", progress
+    elseif completed < 6 then
+        return "Preparing tower controller...", progress
+    elseif elapsed < 3.20 then
+        return "Interface initialized", progress
+    else
+        return "Tower controller initialized", progress
+    end
+end
+
+function X.bootV2Draw(elapsed, fade)
+    local b = X.boot
+    local o = b.objects
+    local v = o.v2
+    if not v then return end
+
+    local ease = X.bootEase
+    local envelope = 1 - fade
+
+    -- Same viewport source as the existing boot tick, including its fallback.
+    local viewport = o.base.AbsoluteSize
+    if viewport.X <= 0 or viewport.Y <= 0 then
+        viewport = bounds.AbsoluteSize
+    end
+    local width = math.max(1, viewport.X)
+    local height = math.max(1, viewport.Y)
+
+    -- No 0.5 scale floor: exceptionally small viewports must still fit.
+    -- Skip remains outside this scaled composition at its existing 96x48.
+    local scale = math.clamp(
+        math.min((width - 32) / 520, (height - 112) / 280),
+        0.01,
+        1
+    )
+    o.centerScale.Scale = scale
+
+    local seed = ease((elapsed - 0.40) / 0.16)
+    local bloom = ease((elapsed - 0.48) / 0.45)
+    local night = ease((elapsed - 0.72) / 0.76)
+    local title = ease((elapsed - 1.50) / 0.62)
+    local subtitle = ease((elapsed - 2.00) / 0.42)
+    local statusGain = ease((elapsed - 2.50) / 0.25)
+    local awakening = ease((elapsed - 0.96) / 0.20)
+        * (1 - ease((elapsed - 1.35) / 0.28))
+
+    local status, target = X.bootStatus(elapsed)
+    local ready = status == "READY"
+
+    -- Readiness changes the payoff, not the boot lifecycle.
+    local payoff = ready and ease((elapsed - 4.00) / 0.28) or 0
+    local sweepTravel = ease((elapsed - 4.40) / 0.60)
+    local sweepGain = ease((elapsed - 4.40) / 0.12)
+        * (1 - ease((elapsed - 4.88) / 0.12))
+    local sweepX = -1.5 + 3 * sweepTravel
+
+    local cool = Color3.fromRGB(131, 183, 255)
+    local warm = Color3.fromRGB(255, 244, 219)
+
+    -- A deliberately broad response envelope, not a pixel collision test
+    -- against Roblox's aspect-dependent UIGradient projection.
+    local function illumination(x, y)
+        local distance = (x - 0.5) - 0.35 * (y - 0.5) - sweepX
+        return math.exp(-distance * distance / 0.024) * sweepGain
+    end
+
+    local titleY = 0.46 + (86 - 140) * scale / height
+    local titleLight = illumination(0.5, titleY)
+
+    o.night.BackgroundTransparency = 1 - 0.94 * night * envelope
+    v.edges.BackgroundTransparency = 1 - 0.72 * night * envelope
+
+    for index, entry in ipairs(o.ribbons) do
+        local phase = elapsed * (2 * math.pi / entry.period) + entry.phase
+        local wave = math.sin(phase)
+        local opening = 0.58 + 0.42 * night
+        entry.object.Position = UDim2.fromScale(
+            0.5 + (entry.x - 0.5) * opening
+                + entry.drift * 0.18 * wave,
+            0.5 + 0.018 * math.cos(phase * 0.7)
+        )
+        entry.object.Size = UDim2.fromScale(0.55, 1.8)
+        entry.object.BackgroundTransparency = 1
+            - (0.11 + 0.025 * index)
+                * night * envelope * (0.86 + 0.14 * wave)
+    end
+
+    for index, shaft in ipairs(v.shafts) do
+        local x = 0.22 + (index - 1) * 0.28
+        shaft.Position = UDim2.fromScale(
+            x + 0.012 * math.sin(elapsed * 0.35 + index),
+            0.5
+        )
+        shaft.BackgroundTransparency = 1
+            - 0.035 * night * envelope
+                * (0.8 + 0.2 * math.sin(elapsed * 0.7 + index))
+    end
+
+    for index, entry in ipairs(o.blooms) do
+        local diameter = (7 + index * 7)
+            * (0.35 + 1.1 * bloom + 0.8 * title)
+        entry.object.Size = UDim2.fromOffset(diameter, diameter)
+        entry.object.BackgroundColor3 = cool:Lerp(warm, titleLight)
+        entry.object.BackgroundTransparency = 1
+            - (0.045 + 0.022 * (8 - index))
+                * bloom * (1 - 0.80 * title) * envelope
+    end
+
+    o.point.BackgroundTransparency =
+        1 - seed * (1 - title) * envelope
+    o.point.Size = UDim2.fromOffset(
+        2 + 1.4 * bloom,
+        2 + 1.4 * bloom
+    )
+
+    o.flare.Size = UDim2.fromOffset(
+        16 + 245 * bloom + 34 * payoff,
+        1
+    )
+    o.flare.BackgroundColor3 = cool:Lerp(warm, titleLight)
+    o.flare.BackgroundTransparency = 1
+        - bloom * (0.58 - 0.39 * title + 0.18 * payoff) * envelope
+    v.vertical.BackgroundTransparency = 1
+        - 0.44 * bloom * (1 - title) * envelope
+
+    v.awakening.TextTransparency = 1 - 0.72 * awakening * envelope
+
+    -- Displacement and size settle monotonically: no elastic bounce.
+    -- TextSize is an integer property, so the interpolated size is rounded.
+    local titlePosition = UDim2.fromOffset(0, 38 + 15 * (1 - title))
+    local titleSize = math.round(98 - 7 * (1 - title))
+    o.title.Position = titlePosition
+    o.title.TextSize = titleSize
+    o.title.TextTransparency = 1 - title * envelope
+
+    local prelight = ease((elapsed - 1.34) / 0.26)
+    v.titleGlow.Position = titlePosition
+    v.titleGlow.TextSize = titleSize + 2
+    v.titleGlow.TextColor3 = cool:Lerp(warm, titleLight)
+    v.titleGlow.TextTransparency = 1
+        - prelight * (0.16 * (1 - title) + 0.055 + 0.10 * titleLight)
+            * envelope
+    v.titleGlow.TextStrokeTransparency = 1
+        - prelight * (0.10 + 0.10 * titleLight) * envelope
+
+    v.titleLight.Position = titlePosition
+    v.titleLight.TextSize = titleSize
+    v.titleLight.TextTransparency =
+        1 - 0.72 * titleLight * title * envelope
+
+    o.subtitle.Position = UDim2.fromOffset(0, 145 + 5 * (1 - subtitle))
+    o.subtitle.TextTransparency = 1 - 0.90 * subtitle * envelope
+    o.subtitle.TextColor3 = Color3.fromRGB(192, 209, 237):Lerp(
+        warm, math.clamp(titleLight + 0.15 * payoff, 0, 1)
+    )
+
+    for index, entry in ipairs(o.motes) do
+        local depth = 0.45 + (index % 3) * 0.23
+        local phase = elapsed * 0.38 + entry.phase
+        local x = entry.x + math.sin(phase) * 0.009 * depth
+        local y = entry.y + math.cos(phase * 0.8) * 0.013 * depth
+        local response = illumination(x, y)
+        local breathing = 0.72 + 0.28 * math.sin(
+            elapsed * 0.85 + entry.phase
+        )
+        local gain = night * envelope
+
+        entry.object.Position = UDim2.fromScale(
+            x + 0.003 * response * depth,
+            y - 0.004 * response * depth
+        )
+        entry.object.BackgroundColor3 = cool:Lerp(warm, response)
+        entry.object.BackgroundTransparency = 1
+            - math.clamp(
+                (0.23 * depth * breathing + 0.65 * response) * gain,
+                0,
+                1
+            )
+
+        local halo = v.halos[index]
+        halo.BackgroundColor3 = cool:Lerp(warm, response)
+        halo.BackgroundTransparency = 1
+            - (0.025 + 0.13 * response) * gain
+    end
+
+    -- Smooth each real checkpoint advance without advancing beyond it.
+    local motion = ease((elapsed - v.progressAt) / 0.34)
+    local shown = v.progressFrom
+        + (v.progressTarget - v.progressFrom) * motion
+
+    if target ~= v.progressTarget then
+        v.progressFrom = math.min(shown, target)
+        v.progressTarget = target
+        v.progressAt = elapsed
+        shown = v.progressFrom
+    end
+    v.progress = math.min(shown, target)
+
+    local pulse = target > 0
+        and math.exp(-math.max(0, elapsed - v.progressAt) * 8)
+        or 0
+
+    o.status.Text = status
+    o.status.TextSize = ready and 15 or 12
+    o.status.TextColor3 = ready and warm or Color3.fromRGB(183, 200, 224)
+    o.status.TextTransparency = 1 - statusGain * envelope
+
+    o.track.BackgroundTransparency = 1 - 0.25 * statusGain * envelope
+    o.progress.Size = UDim2.fromScale(v.progress, 1)
+    o.progress.BackgroundTransparency = 1 - 0.50 * statusGain * envelope
+
+    local markerPosition = UDim2.fromScale(v.progress, 0.5)
+    o.diamond.Position = markerPosition
+    o.diamond.Size = UDim2.fromOffset(5 + pulse, 5 + pulse)
+    o.diamond.BackgroundTransparency =
+        1 - 0.94 * statusGain * envelope
+
+    v.trail.Position = markerPosition
+    v.trail.Size = UDim2.fromOffset(math.min(58, 290 * v.progress), 2)
+    v.trail.BackgroundTransparency = 1 - 0.32 * statusGain * envelope
+
+    v.markerLight.Position = markerPosition
+    v.markerLight.BackgroundTransparency = 1
+        - (0.16 + 0.22 * pulse + 0.07 * payoff) * statusGain * envelope
+
+    o.sweepGradient.Offset = Vector2.new(sweepX, 0)
+    v.sweepOuterGradient.Offset = Vector2.new(sweepX, 0)
+    o.sweep.BackgroundTransparency =
+        1 - 0.58 * sweepGain * envelope
+    v.sweepOuter.BackgroundTransparency =
+        1 - 0.16 * sweepGain * envelope
+
+    local skipGain = ease((elapsed - 0.50) / 0.25)
+    o.skip.BackgroundTransparency = 1 - 0.15 * skipGain * envelope
+    if v.skipStroke then
+        v.skipStroke.Transparency = 1 - 0.25 * skipGain * envelope
+    end
 end
 
 function X.bootTick()
@@ -4417,8 +4873,15 @@ function X.bootTick()
         error("Existing shell was removed.")
     end
 
+    -- `now` is the real wall clock and always advances. Two clocks are kept
+    -- deliberately separate:
+    --   presentation clock (`elapsed`): freezes at the skip timestamp, so the
+    --     cinematic holds its current frame once Skip is pressed;
+    --   release clock (`now - b.skipAt`): keeps running, so the skip dissolve
+    --     always completes and bootFinish is always reached.
     local now = os.clock()
-    local elapsed = math.max(0, now - b.startedAt)
+    local presentationNow = b.skipAt or now
+    local elapsed = math.max(0, presentationNow - b.startedAt)
     local fade = X.bootEase((elapsed - 5.00) / 0.30)
 
     if b.skipAt then
@@ -4543,6 +5006,8 @@ function X.bootTick()
     o.skip.TextTransparency =
         1 - 0.92 * skipGain * visibleEnvelope
     o.skip.Text = b.skipAt and "Opening" or "Skip  >"
+
+    X.bootV2Draw(elapsed, fade)
 
     if fade >= 1 or elapsed >= b.duration then
         X.bootFinish(false)
